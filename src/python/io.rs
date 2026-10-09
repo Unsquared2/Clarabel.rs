@@ -25,14 +25,14 @@ macro_rules! make_python_stdio {
                 self.cbuffer.clear();
                 self.cbuffer.extend_from_slice(buf);
                 self.cbuffer.push(0);
-                Python::with_gil(|_py| unsafe {
+                Python::attach(|_py| unsafe {
                     $pyfunc(self.cbuffer.as_ptr() as *const c_char);
                 });
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 // call the python flush() on sys.$pymodname
-                Python::with_gil(|py| -> std::io::Result<()> {
+                Python::attach(|py| -> std::io::Result<()> {
                     py.run(
                         c_str!(std::concat!("import sys; sys.", $pymodname, ".flush()")),
                         None,

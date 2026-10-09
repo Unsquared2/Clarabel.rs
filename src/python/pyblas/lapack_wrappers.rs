@@ -6,7 +6,7 @@ use lazy_static::lazy_static;
 use libc::c_char;
 
 lazy_static! {
-    static ref PYLAPACK: PyLapackPointers = pyo3::Python::with_gil(|py| {
+    static ref PYLAPACK: PyLapackPointers = pyo3::Python::attach(|py| {
         PyLapackPointers::new(py).expect("Failed to load SciPy LAPACK bindings.")
     });
 }

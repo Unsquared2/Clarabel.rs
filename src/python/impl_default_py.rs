@@ -38,7 +38,7 @@ use std::fmt::Write;
 // ----------------------------------
 
 #[derive(Clone)]
-#[pyclass(name = "LinearSolverInfo")]
+#[pyclass(from_py_object, name = "LinearSolverInfo")]
 pub struct PyLinearSolverInfo {
     #[pyo3(get)]
     pub name: String,
@@ -91,7 +91,7 @@ impl PyLinearSolverInfo {
 }
 
 #[derive(Debug, Clone)]
-#[pyclass(name = "DefaultInfo")]
+#[pyclass(from_py_object, name = "DefaultInfo")]
 pub struct PyDefaultInfo {
     #[pyo3(get)]
     pub mu: f64,
@@ -276,7 +276,7 @@ impl From<SolverError> for PyErr {
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
-#[pyclass(eq, eq_int, name = "SolverStatus")]
+#[pyclass(from_py_object, eq, eq_int, name = "SolverStatus")]
 pub enum PySolverStatus {
     Unsolved = 0,
     Solved,
@@ -348,7 +348,7 @@ impl From<SettingsError> for PyErr {
 }
 
 #[derive(Debug, Clone)]
-#[pyclass(name = "DefaultSettings")]
+#[pyclass(from_py_object, name = "DefaultSettings")]
 pub struct PyDefaultSettings {
     #[pyo3(get, set)]
     pub max_iter: u32,
@@ -650,7 +650,7 @@ impl PyDefaultSolver {
     }
 
     fn solve(&mut self, py: Python<'_>) -> PyDefaultSolution {
-        py.allow_threads(|| self.inner.solve());
+        py.detach(|| self.inner.solve());
         self.get_solution()
     }
 
@@ -776,7 +776,7 @@ impl PyDefaultSolver {
         (&self.inner.info).into()
     }
 
-    fn set_termination_callback(&mut self, callback: PyObject) {
+    fn set_termination_callback(&mut self, callback: Py<PyAny>) {
         let callback = make_termination_callback(callback);
         self.inner.set_termination_callback(callback);
     }
@@ -796,12 +796,12 @@ impl PyDefaultSolver {
 
 // Create a Rust closure that wraps the Python callback
 pub fn make_termination_callback(
-    py_callback: PyObject,
+    py_callback: Py<PyAny>,
 ) -> impl ClarabelCallbackFn<DefaultInfo<f64>> {
     move |info: &DefaultInfo<f64>| {
         let py_info = PyDefaultInfo::from(info);
 
-        Python::with_gil(|py| match py_callback.call1(py, (py_info,)) {
+        Python::attach(|py| match py_callback.call1(py, (py_info,)) {
             Ok(result) => result.extract::<bool>(py).unwrap_or(false),
             Err(e) => {
                 e.print(py);

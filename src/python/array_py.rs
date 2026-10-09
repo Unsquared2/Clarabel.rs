@@ -23,7 +23,7 @@ fn contiguous_bytes<'py>(obj: &Bound<'py, PyAny>, dtype: &str) -> Option<Bound<'
     if ndim != 1 {
         return None;
     }
-    arr.call_method0("tobytes").ok()?.downcast_into::<PyBytes>().ok()
+    arr.call_method0("tobytes").ok()?.cast_into::<PyBytes>().ok()
 }
 
 /// A vector of f64 from any sequence or numpy array of numbers
@@ -67,8 +67,11 @@ pub(crate) fn extract_usize_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> 
 /// Wrapper type so that vector arguments can use the fast conversion
 pub(crate) struct PyF64Vec(pub Vec<f64>);
 
-impl<'a> FromPyObject<'a> for PyF64Vec {
-    fn extract_bound(obj: &Bound<'a, PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for PyF64Vec {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, pyo3::PyAny>) -> PyResult<Self> {
+        let obj: &Bound<'py, pyo3::PyAny> = &obj;
         extract_f64_vec(obj).map(PyF64Vec)
     }
 }

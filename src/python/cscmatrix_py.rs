@@ -22,8 +22,11 @@ impl From<PyCscMatrix> for CscMatrix<f64> {
     }
 }
 
-impl<'a> FromPyObject<'a> for PyCscMatrix {
-    fn extract_bound(obj: &Bound<'a, pyo3::PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for PyCscMatrix {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, pyo3::PyAny>) -> PyResult<Self> {
+        let obj: &Bound<'py, pyo3::PyAny> = &obj;
         let nzval = extract_f64_vec(&obj.getattr("data")?)?;
         let rowval = extract_usize_vec(&obj.getattr("indices")?)?;
         let colptr = extract_usize_vec(&obj.getattr("indptr")?)?;
