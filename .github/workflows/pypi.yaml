@@ -39,7 +39,7 @@ jobs:
             test: false
             
           # macOS Intel build
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64
             features: "python,pardiso"
             test: true

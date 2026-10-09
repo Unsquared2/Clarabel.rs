@@ -633,12 +633,13 @@ impl PyDefaultSolver {
     #[new]
     fn new(
         P: PyCscMatrix,
-        q: Vec<f64>,
+        q: PyF64Vec,
         A: PyCscMatrix,
-        b: Vec<f64>,
+        b: PyF64Vec,
         cones: Vec<PySupportedCone>,
         settings: PyDefaultSettings,
     ) -> PyResult<Self> {
+        let (q, b) = (q.0, b.0);
         let cones = _py_to_native_cones(cones);
         let settings = settings.to_internal()?;
 
@@ -845,7 +846,7 @@ fn _py_to_matrix_update(arg: Bound<'_, PyAny>) -> Option<PyMatrixUpdateData> {
 
 fn _py_to_vector_update(arg: Bound<'_, PyAny>) -> Option<PyVectorUpdateData> {
     // try converting to a complete data vector
-    let values: Option<Vec<f64>> = arg.extract().ok();
+    let values: Option<Vec<f64>> = extract_f64_vec(&arg).ok();
     if let Some(values) = values {
         return Some(PyVectorUpdateData::Vector(values));
     }

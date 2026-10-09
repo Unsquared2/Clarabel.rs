@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use super::array_py::{extract_f64_vec, extract_usize_vec};
 use crate::algebra::CscMatrix;
 use core::ops::Deref;
 use pyo3::prelude::*;
@@ -23,9 +24,9 @@ impl From<PyCscMatrix> for CscMatrix<f64> {
 
 impl<'a> FromPyObject<'a> for PyCscMatrix {
     fn extract_bound(obj: &Bound<'a, pyo3::PyAny>) -> PyResult<Self> {
-        let nzval: Vec<f64> = obj.getattr("data")?.extract()?;
-        let rowval: Vec<usize> = obj.getattr("indices")?.extract()?;
-        let colptr: Vec<usize> = obj.getattr("indptr")?.extract()?;
+        let nzval = extract_f64_vec(&obj.getattr("data")?)?;
+        let rowval = extract_usize_vec(&obj.getattr("indices")?)?;
+        let colptr = extract_usize_vec(&obj.getattr("indptr")?)?;
         let shape: Vec<usize> = obj.getattr("shape")?.extract()?;
 
         let mut mat = CscMatrix::new(shape[0], shape[1], colptr, rowval, nzval);

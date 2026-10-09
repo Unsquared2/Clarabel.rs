@@ -260,9 +260,24 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let mut has_bound = vec![false; dim];
         b_col.iter().for_each(|&j| has_bound[j] = true);
 
-        // choose a backend: banded if RCM gives a small bandwidth
+        // Choose a backend.  Narrow bands (up to 8) always use the banded
+        // factorization.  Wider ones (up to BANDED_MAX_KB) use it if its
+        // dense band costs at most twice the flops of a sparse
+        // factorization, estimated from the AMD analysis that the sparse
+        // backend needs anyway.
         let (perm, bw) = rcm_ordering(&KKT, &signs);
-        let use_banded = bw <= BANDED_MAX_KB && !test_hooks::no_banded();
+        // AMD on the pattern of the full KKT system; see below
+        let full_amd = || amd_order(&full_kkt_pattern(P, A));
+        let mut amd = None;
+        let use_banded = !test_hooks::no_banded()
+            && (bw <= 8
+                || (bw <= BANDED_MAX_KB && {
+                    let (fperm, iperm, info) = full_amd();
+                    let sparse_flops = (info.n_div + info.n_mult_subs_ldl) as f64;
+                    let band_flops = (dim * bw * (bw + 1) / 2) as f64;
+                    amd = Some((fperm, iperm, info));
+                    band_flops <= 2.0 * sparse_flops
+                }));
 
         let (backend, band_map, iperm, lanes_len, offset) = if use_banded {
             let band = BandedLDL::new(
@@ -289,7 +304,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
             // placed: the factor of the reduced system has no more fill
             // than that of the full one.  (Ordering the reduced matrix
             // directly can be noticeably worse.)
-            let (fperm, _, info) = amd_order(&full_kkt_pattern(P, A));
+            let (fperm, _, info) = amd.unwrap_or_else(full_amd);
             let perm: Vec<usize> = fperm
                 .iter()
                 .filter_map(|&f| match f.checked_sub(n) {

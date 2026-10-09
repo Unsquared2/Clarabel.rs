@@ -20,7 +20,33 @@
 
 use crate::algebra::*;
 
-pub const BANDED_MAX_KB: usize = 8;
+pub const BANDED_MAX_KB: usize = 16;
+
+// Call an expression with the bandwidth as a const generic `$K`, for every
+// supported bandwidth 1..=BANDED_MAX_KB.
+macro_rules! dispatch_kb {
+    ($kb:expr, $K:ident => $call:expr) => {
+        match $kb {
+            1 => { const $K: usize = 1; $call }
+            2 => { const $K: usize = 2; $call }
+            3 => { const $K: usize = 3; $call }
+            4 => { const $K: usize = 4; $call }
+            5 => { const $K: usize = 5; $call }
+            6 => { const $K: usize = 6; $call }
+            7 => { const $K: usize = 7; $call }
+            8 => { const $K: usize = 8; $call }
+            9 => { const $K: usize = 9; $call }
+            10 => { const $K: usize = 10; $call }
+            11 => { const $K: usize = 11; $call }
+            12 => { const $K: usize = 12; $call }
+            13 => { const $K: usize = 13; $call }
+            14 => { const $K: usize = 14; $call }
+            15 => { const $K: usize = 15; $call }
+            16 => { const $K: usize = 16; $call }
+            _ => unreachable!("unsupported bandwidth"),
+        }
+    };
+}
 
 // Test-only switches that force the less common code paths.  They compile
 // to constants outside of `cfg(test)`.
@@ -387,29 +413,9 @@ impl<T: FloatT> BandedLDL<T> {
 
     pub fn refactor(&mut self) -> bool {
         if self.twisted.is_some() {
-            return match self.kb {
-                1 => self.factor_twisted::<1>(),
-                2 => self.factor_twisted::<2>(),
-                3 => self.factor_twisted::<3>(),
-                4 => self.factor_twisted::<4>(),
-                5 => self.factor_twisted::<5>(),
-                6 => self.factor_twisted::<6>(),
-                7 => self.factor_twisted::<7>(),
-                8 => self.factor_twisted::<8>(),
-                _ => unreachable!(),
-            };
+            return dispatch_kb!(self.kb, KB => self.factor_twisted::<KB>());
         }
-        match self.kb {
-            1 => self.factor_kb::<1>(),
-            2 => self.factor_kb::<2>(),
-            3 => self.factor_kb::<3>(),
-            4 => self.factor_kb::<4>(),
-            5 => self.factor_kb::<5>(),
-            6 => self.factor_kb::<6>(),
-            7 => self.factor_kb::<7>(),
-            8 => self.factor_kb::<8>(),
-            _ => unreachable!(),
-        }
+        dispatch_kb!(self.kb, KB => self.factor_kb::<KB>())
     }
 
 
@@ -794,29 +800,9 @@ impl<T: FloatT> BandedLDL<T> {
     /// coordinates.  `x` must have length (n + 2 kb) with zero padding.
     pub fn solve_permuted<const NR: usize>(&self, x: &mut [[T; NR]]) {
         if self.twisted.is_some() {
-            return match self.kb {
-                1 => self.solve_twisted::<1, NR>(x),
-                2 => self.solve_twisted::<2, NR>(x),
-                3 => self.solve_twisted::<3, NR>(x),
-                4 => self.solve_twisted::<4, NR>(x),
-                5 => self.solve_twisted::<5, NR>(x),
-                6 => self.solve_twisted::<6, NR>(x),
-                7 => self.solve_twisted::<7, NR>(x),
-                8 => self.solve_twisted::<8, NR>(x),
-                _ => unreachable!(),
-            };
+            return dispatch_kb!(self.kb, KB => self.solve_twisted::<KB, NR>(x));
         }
-        match self.kb {
-            1 => self.solve_kb::<1, NR>(x),
-            2 => self.solve_kb::<2, NR>(x),
-            3 => self.solve_kb::<3, NR>(x),
-            4 => self.solve_kb::<4, NR>(x),
-            5 => self.solve_kb::<5, NR>(x),
-            6 => self.solve_kb::<6, NR>(x),
-            7 => self.solve_kb::<7, NR>(x),
-            8 => self.solve_kb::<8, NR>(x),
-            _ => unreachable!(),
-        }
+        dispatch_kb!(self.kb, KB => self.solve_kb::<KB, NR>(x))
     }
 
     #[inline(never)]
@@ -875,17 +861,7 @@ impl<T: FloatT> BandedLDL<T> {
     /// e -= A x for NR right hand sides, permuted coordinates, padded.
     /// Returns the inf norm of the result per rhs (NaN if it has any).
     pub fn residual_permuted<const NR: usize>(&self, e: &mut [[T; NR]], x: &[[T; NR]]) -> [T; NR] {
-        match self.kb {
-            1 => self.residual_kb::<1, NR>(e, x),
-            2 => self.residual_kb::<2, NR>(e, x),
-            3 => self.residual_kb::<3, NR>(e, x),
-            4 => self.residual_kb::<4, NR>(e, x),
-            5 => self.residual_kb::<5, NR>(e, x),
-            6 => self.residual_kb::<6, NR>(e, x),
-            7 => self.residual_kb::<7, NR>(e, x),
-            8 => self.residual_kb::<8, NR>(e, x),
-            _ => unreachable!(),
-        }
+        dispatch_kb!(self.kb, KB => self.residual_kb::<KB, NR>(e, x))
     }
 
     #[inline(never)]
