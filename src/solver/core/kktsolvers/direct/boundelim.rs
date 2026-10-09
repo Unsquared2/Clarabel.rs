@@ -29,6 +29,16 @@
 //! are formed with K₀ = [P A_R'; A_R -H_R], i.e. without D, which avoids
 //! cancellation against the large entries of D.
 //!
+//! Auxiliary variables are eliminated as well: a variable j with no bound
+//! and no off-diagonal entries in P, P_jj > 0, and a single entry a in A,
+//! in a remaining row r.  Modelling tools introduce these for every
+//! least-squares term (t = Fx, minimizing ‖t‖²).  Its variable row
+//! P_jj x_j + a z_r = rx_j gives x_j = (rx_j - a z_r)/P_jj, which turns
+//! row r into  A_r x - (H_r + a²/P_jj) z_r = rz_r - (a/P_jj) rx_j : the
+//! variable leaves the system, and row r gains a nonzero pivot even when
+//! it is an equality.  As for bound rows, refinement measures residuals of
+//! the full system.
+//!
 //! The reduced system is factored with a dense-band LDLᵀ when a reverse
 //! Cuthill-McKee ordering gives a small bandwidth (1D structures such as
 //! rods, beams, chains and time-stepped control problems), and otherwise
@@ -70,11 +80,28 @@ pub struct BoundElimKKTSolver<T> {
     // eliminated bounds of variable j are b_*[bptr[j]..bptr[j+1]]
     bptr: Vec<usize>,
 
+    // eliminated auxiliary variables: variable, its constraint row and
+    // that row's vector index, A nz index, coefficient, P_jj, and 1/π and
+    // a/π for the pivot π used (P_jj, regularized if small)
+    v_var: Vec<usize>,
+    v_row: Vec<usize>,
+    v_rpos: Vec<usize>,
+    v_nz: Vec<usize>,
+    v_coef: Vec<T>,
+    v_p: Vec<T>,
+    v_pinv: Vec<T>,
+    v_ca: Vec<T>,
+    // index into v_* of every variable (usize::MAX if not eliminated)
+    elim_of: Vec<usize>,
+
     // remaining rows: original constraint row index, vector index
     r_row: Vec<usize>,
     r_pos: Vec<usize>,
-    // vector index of each variable
+    // the variables that are not eliminated, and their vector indices
+    x_var: Vec<usize>,
     x_pos: Vec<usize>,
+    // vector index of every variable (usize::MAX if eliminated)
+    var_pos: Vec<usize>,
     // vector index = backend position + offset (banded padding)
     offset: usize,
 
@@ -120,6 +147,11 @@ pub struct BoundElimKKTSolver<T> {
     zb: [Vec<T>; NR],
     eb: [Vec<T>; NR],
     dzb: [Vec<T>; NR],
+    // the same for the eliminated auxiliary variables
+    rxv: [Vec<T>; NR],
+    xv: [Vec<T>; NR],
+    exv: [Vec<T>; NR],
+    dxv: [Vec<T>; NR],
     // scalar work for the general sparse backend
     w0: Vec<T>,
     w1: Vec<T>,
@@ -179,9 +211,41 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         }
         let mr = r_row.len();
 
+        // auxiliary variables to eliminate: no off-diagonal entries in P
+        // (upper triangle; any lower triangle data is ignored throughout),
+        // P_jj > 0, and a single entry in A, in a remaining row
+        let mut p_offdiag = vec![false; n];
+        let mut pjj = vec![T::zero(); n];
+        for j in 0..n {
+            for k in P.colptr[j]..P.colptr[j + 1] {
+                let i = P.rowval[k];
+                if i < j {
+                    p_offdiag[i] = true;
+                    p_offdiag[j] = true;
+                } else if i == j {
+                    pjj[j] += P.nzval[k];
+                }
+            }
+        }
+        let mut elim_of = vec![usize::MAX; n];
+        let mut v_var = vec![];
+        for j in 0..n {
+            let (k0, k1) = (A.colptr[j], A.colptr[j + 1]);
+            if !p_offdiag[j] && pjj[j] > T::zero() && k1 == k0 + 1 && !is_bound[A.rowval[k0]] {
+                elim_of[j] = v_var.len();
+                v_var.push(j);
+            }
+        }
+        // reduced index of every variable that is not eliminated
+        let mut vidx = vec![usize::MAX; n];
+        let x_var: Vec<usize> = (0..n).filter(|&j| elim_of[j] == usize::MAX).collect();
+        x_var.iter().enumerate().for_each(|(i, &j)| vidx[j] = i);
+        let nr = x_var.len();
+
         // bounds are collected column by column, so are sorted by variable
         let (mut b_row, mut b_col, mut b_nz, mut b_coef) = (vec![], vec![], vec![], vec![]);
-        // A_R in coordinate form sorted by row: (row, col, A nz index)
+        let (mut v_row, mut v_nz, mut v_coef) = (vec![], vec![], vec![]);
+        // A_R in coordinate form sorted by row: (row, reduced col, A nz index)
         let mut ar: Vec<(usize, usize, usize)> = Vec::with_capacity(A.nnz());
         for j in 0..n {
             for k in A.colptr[j]..A.colptr[j + 1] {
@@ -191,16 +255,33 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                     b_col.push(j);
                     b_nz.push(k);
                     b_coef.push(A.nzval[k]);
+                } else if elim_of[j] != usize::MAX {
+                    v_row.push(r);
+                    v_nz.push(k);
+                    v_coef.push(A.nzval[k]);
                 } else {
-                    ar.push((ridx[r], j, k));
+                    ar.push((ridx[r], vidx[j], k));
                 }
             }
         }
-        ar.sort_unstable();
+        // sort by row: a stable counting sort of these column-ordered
+        // entries, so columns stay ascending within each row
+        let mut rptr = vec![0usize; mr + 1];
+        ar.iter().for_each(|e| rptr[e.0 + 1] += 1);
+        for r in 0..mr {
+            rptr[r + 1] += rptr[r];
+        }
+        let mut sorted = vec![(0, 0, 0); ar.len()];
+        for &e in &ar {
+            sorted[rptr[e.0]] = e;
+            rptr[e.0] += 1;
+        }
+        let ar = sorted;
+        let v_p: Vec<T> = v_var.iter().map(|&j| pjj[j]).collect();
 
-        // assemble K₀ (triu) of dimension n + mr
-        let dim = n + mr;
-        let nnz_est = P.nnz() + n + ar.len() + mr;
+        // assemble K₀ (triu) of dimension nr + mr
+        let dim = nr + mr;
+        let nnz_est = P.nnz() + nr + ar.len() + mr;
         let mut colptr = Vec::with_capacity(dim + 1);
         let mut rowval = Vec::with_capacity(nnz_est);
         let mut nzval = Vec::with_capacity(nnz_est);
@@ -208,29 +289,31 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let mut diag_nat = vec![0usize; dim];
         let mut p_diag_nat = vec![T::zero(); dim];
         colptr.push(0);
-        for j in 0..n {
+        for (jr, &j) in x_var.iter().enumerate() {
             let mut has_diag = false;
             for k in P.colptr[j]..P.colptr[j + 1] {
                 let i = P.rowval[k];
                 if i > j {
                     continue; // ignore any lower triangle data
                 }
+                // an eliminated variable has no off-diagonal entries
+                let ir = vidx[i];
                 if i == j {
-                    p_diag_nat[j] += P.nzval[k];
+                    p_diag_nat[jr] += P.nzval[k];
                     if has_diag {
                         p_map[k] = DUP_DIAG;
                         continue;
                     }
                     has_diag = true;
-                    diag_nat[j] = rowval.len();
+                    diag_nat[jr] = rowval.len();
                 }
                 p_map[k] = rowval.len();
-                rowval.push(i);
+                rowval.push(ir);
                 nzval.push(P.nzval[k]);
             }
             if !has_diag {
-                diag_nat[j] = rowval.len();
-                rowval.push(j);
+                diag_nat[jr] = rowval.len();
+                rowval.push(jr);
                 nzval.push(T::zero());
             }
             colptr.push(rowval.len());
@@ -239,33 +322,38 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let mut q = 0;
         for r in 0..mr {
             while q < ar.len() && ar[q].0 == r {
-                let (_, j, k) = ar[q];
+                let (_, jr, k) = ar[q];
                 a_map.push((k, rowval.len()));
-                rowval.push(j);
+                rowval.push(jr);
                 nzval.push(A.nzval[k]);
                 q += 1;
             }
-            diag_nat[n + r] = rowval.len();
-            rowval.push(n + r);
+            diag_nat[nr + r] = rowval.len();
+            rowval.push(nr + r);
             nzval.push(T::zero());
             colptr.push(rowval.len());
         }
         let mut KKT = CscMatrix::new(dim, dim, colptr, rowval, nzval);
-        for j in 0..n {
-            KKT.nzval[diag_nat[j]] = p_diag_nat[j];
+        for jr in 0..nr {
+            KKT.nzval[diag_nat[jr]] = p_diag_nat[jr];
         }
 
         let mut signs = vec![1_i8; dim];
-        signs[n..].fill(-1);
+        signs[nr..].fill(-1);
         let mut has_bound = vec![false; dim];
-        b_col.iter().for_each(|&j| has_bound[j] = true);
+        b_col.iter().for_each(|&j| has_bound[vidx[j]] = true);
 
         // Choose a backend.  Narrow bands (up to 8) always use the banded
         // factorization.  Wider ones (up to BANDED_MAX_KB) use it if its
         // dense band costs at most twice the flops of a sparse
         // factorization, estimated from the AMD analysis that the sparse
         // backend needs anyway.
-        let (perm, bw) = rcm_ordering(&KKT, &signs);
+        // (rows with an eliminated variable have the pivot -(H + a²/P_jj),
+        // which is not small, so the ordering need not place them after
+        // their variables: sign 0)
+        let mut ord_signs = signs.clone();
+        v_row.iter().for_each(|&r| ord_signs[nr + ridx[r]] = 0);
+        let (perm, bw) = rcm_ordering(&KKT, &ord_signs);
         // AMD on the pattern of the full KKT system; see below
         let full_amd = || amd_order(&full_kkt_pattern(P, A));
         let mut amd = None;
@@ -299,18 +387,20 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         } else {
             // Order with AMD on the pattern of the full KKT system, as
             // the full solver does, and drop the bound rows from that
-            // order.  A bound row has a single neighbour, so eliminating
-            // it creates no fill among the other nodes wherever it is
-            // placed: the factor of the reduced system has no more fill
-            // than that of the full one.  (Ordering the reduced matrix
-            // directly can be noticeably worse.)
+            // order, and the eliminated variables.  Each of those has a
+            // single neighbour, so eliminating it creates no fill among
+            // the other nodes wherever it is placed: the factor of the
+            // reduced system has no more fill than that of the full one.
+            // (Ordering the reduced matrix directly can be noticeably
+            // worse.)
             let (fperm, _, info) = amd.unwrap_or_else(full_amd);
             let perm: Vec<usize> = fperm
                 .iter()
                 .filter_map(|&f| match f.checked_sub(n) {
-                    None => Some(f),
+                    None if elim_of[f] != usize::MAX => None,
+                    None => Some(vidx[f]),
                     Some(r) if is_bound[r] => None,
-                    Some(r) => Some(n + ridx[r]),
+                    Some(r) => Some(nr + ridx[r]),
                 })
                 .collect();
             let ldl = direct_ldl(&KKT, &signs, settings, perm, &info);
@@ -319,9 +409,11 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
 
         // vector index of every reduced index
         let pos: Vec<usize> = iperm.iter().map(|&p| p + offset).collect();
-        let x_pos = pos[0..n].to_vec();
-        let r_pos = pos[n..].to_vec();
-        let b_pos: Vec<usize> = b_col.iter().map(|&j| pos[j]).collect();
+        let x_pos = pos[0..nr].to_vec();
+        let r_pos = pos[nr..].to_vec();
+        let var_pos: Vec<usize> = vidx.iter().map(|&i| if i == usize::MAX { i } else { pos[i] }).collect();
+        let b_pos: Vec<usize> = b_col.iter().map(|&j| var_pos[j]).collect();
+        let v_rpos: Vec<usize> = v_row.iter().map(|&r| pos[nr + ridx[r]]).collect();
 
         // diagonal data in backend order
         let mut diag_idx = vec![0usize; dim];
@@ -346,7 +438,23 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let zl = [T::zero(); NR];
         let lane = |len: usize| -> [Vec<T>; NR] { std::array::from_fn(|_| vec![T::zero(); len]) };
         let wlen = if use_banded { 0 } else { dim };
+        let nv = v_var.len();
         let mut s = Self {
+            v_var,
+            v_row,
+            v_rpos,
+            v_nz,
+            v_coef,
+            v_p,
+            v_pinv: vec![T::zero(); nv],
+            v_ca: vec![T::zero(); nv],
+            elim_of,
+            x_var,
+            var_pos,
+            rxv: lane(nv),
+            xv: lane(nv),
+            exv: lane(nv),
+            dxv: lane(nv),
             b_row,
             b_pos,
             b_nz,
@@ -409,9 +517,28 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                 assert!(v.len() == nb);
             }
         }
-        let n = self.x_pos.len();
+        // K₀ structure, for symv_lanes_sub
+        let K = &self.KKT;
+        assert!(K.colptr.len() == K.n + 1 && K.colptr.windows(2).all(|w| w[0] <= w[1]));
+        assert!(K.rowval.iter().all(|&i| i < K.n) && K.colptr[K.n] <= K.rowval.len());
+        let n = self.var_pos.len();
         assert!(self.bptr.len() == n + 1 && self.bptr[n] == nb);
         assert!(self.bptr.windows(2).all(|w| w[0] <= w[1]));
+        assert!(self.x_var.len() == self.x_pos.len() && self.x_var.iter().all(|&j| j < n));
+        let nv = self.v_var.len();
+        assert!(self.v_var.iter().all(|&j| j < n) && self.v_rpos.iter().all(|&p| p < len));
+        assert!(self.elim_of.len() == n && self.x_var.len() + nv == n);
+        for v in [&self.v_row, &self.v_rpos, &self.v_nz] {
+            assert!(v.len() == nv);
+        }
+        for v in [&self.v_coef, &self.v_p, &self.v_pinv, &self.v_ca] {
+            assert!(v.len() == nv);
+        }
+        for l in 0..NR {
+            for v in [&self.rxv[l], &self.xv[l], &self.exv[l], &self.dxv[l]] {
+                assert!(v.len() == nv);
+            }
+        }
     }
 
     // copy all K₀ values into the band storage
@@ -439,13 +566,13 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
     fn reduce_rhs<const L: usize>(&mut self, rhs: [(&[T], &[T]); L]) {
         let m = self.hs.len();
         for (rx, rz) in &rhs {
-            assert!(rx.len() == self.x_pos.len() && rz.len() == m);
+            assert!(rx.len() == self.var_pos.len() && rz.len() == m);
         }
         let (b, b0) = (&mut self.b, &mut self.b0);
         let (b_row, b_ch, bptr) = (&self.b_row, &self.b_ch, &self.bptr);
         let [rzb0, rzb1] = &mut self.rzb;
         unsafe {
-            for (j, &p) in self.x_pos.iter().enumerate() {
+            for (&j, &p) in self.x_var.iter().zip(&self.x_pos) {
                 let mut v = [T::zero(); NR];
                 for l in 0..L {
                     v[l] = *rhs[l].0.get_unchecked(j);
@@ -473,9 +600,21 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                 *b.get_unchecked_mut(p) = v;
                 *b0.get_unchecked_mut(p) = v;
             }
+            // eliminated variables: rz_r - (a/π) rx_j in their rows
+            for e in 0..self.v_var.len() {
+                let j = *self.v_var.get_unchecked(e);
+                let c = *self.v_ca.get_unchecked(e);
+                let bp = b.get_unchecked_mut(*self.v_rpos.get_unchecked(e));
+                for l in 0..L {
+                    let t = *rhs[l].0.get_unchecked(j);
+                    *self.rxv[l].get_unchecked_mut(e) = t;
+                    bp[l] = fmadd(-c, t, bp[l]);
+                }
+            }
         }
         if L < 2 {
             rzb1.fill(T::zero());
+            self.rxv[1].fill(T::zero());
         }
         let mut normb = [T::zero(); NR];
         for (l, nb) in normb.iter_mut().enumerate().take(L) {
@@ -488,14 +627,19 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
     fn expand_lhs<const L: usize>(&self, lhs: [(&mut [T], &mut [T]); L]) {
         let m = self.hs.len();
         for (lx, lz) in &lhs {
-            assert!(lx.len() == self.x_pos.len() && lz.len() == m);
+            assert!(lx.len() == self.var_pos.len() && lz.len() == m);
         }
         let x = &self.x;
         unsafe {
-            for (j, &p) in self.x_pos.iter().enumerate() {
+            for (&j, &p) in self.x_var.iter().zip(&self.x_pos) {
                 let xj = *x.get_unchecked(p);
                 for l in 0..L {
                     *lhs[l].0.get_unchecked_mut(j) = xj[l];
+                }
+            }
+            for (e, &j) in self.v_var.iter().enumerate() {
+                for l in 0..L {
+                    *lhs[l].0.get_unchecked_mut(j) = *self.xv[l].get_unchecked(e);
                 }
             }
             for (&p, &row) in self.r_pos.iter().zip(&self.r_row) {
@@ -554,11 +698,29 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         }
     }
 
-    // Residual of the full KKT system for (x, zb), into e (variable and
-    // remaining rows, backend order) and eb (eliminated rows).  Returns
-    // its inf norm per lane (NaN if it has any).
-    fn full_residual(&mut self, use_dx: bool, nlanes: usize) -> [T; NR] {
+    // x_j = (r - a z_r)/π for each eliminated variable and lane
+    fn recover_xv(&self, x: &[[T; NR]], r: &[Vec<T>; NR], xv: &mut [Vec<T>; NR]) {
+        assert!(x.len() == self.b.len());
+        // SAFETY: lengths and v_rpos < b.len() == x.len() checked in new()
+        unsafe {
+            for e in 0..self.v_var.len() {
+                let pinv = *self.v_pinv.get_unchecked(e);
+                let a = *self.v_coef.get_unchecked(e);
+                let zr = *x.get_unchecked(*self.v_rpos.get_unchecked(e));
+                for l in 0..NR {
+                    *xv[l].get_unchecked_mut(e) = pinv * (*r[l].get_unchecked(e) - a * zr[l]);
+                }
+            }
+        }
+    }
+
+    // Residual of the full KKT system for (x, zb, xv), into e (variable
+    // and remaining rows, backend order), eb (eliminated rows) and exv
+    // (eliminated variables).  Returns its inf norm per lane (NaN if it
+    // has any).
+    fn full_residual(&mut self, use_dx: bool) -> [T; NR] {
         let (x, zb) = if use_dx { (&self.dx, &self.dzb) } else { (&self.x, &self.zb) };
+        let xv = if use_dx { &self.dxv } else { &self.xv };
         let e = &mut self.e;
         e.copy_from_slice(&self.b0);
         // eliminated rows: their columns of A_B' in the variable rows, and
@@ -583,23 +745,28 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                 nb[0] = if v0.abs() > nb[0] || v0.is_nan() { v0.abs() } else { nb[0] };
                 nb[1] = if v1.abs() > nb[1] || v1.is_nan() { v1.abs() } else { nb[1] };
             }
+            // eliminated variables: their column of A in their row, and
+            // their own rows rx_j - P_jj x_j - a z_r
+            for i in 0..self.v_var.len() {
+                let a = *self.v_coef.get_unchecked(i);
+                let pjj = *self.v_p.get_unchecked(i);
+                let p = *self.v_rpos.get_unchecked(i);
+                let zr = *x.get_unchecked(p);
+                let ep = e.get_unchecked_mut(p);
+                for l in 0..NR {
+                    let xi = *xv[l].get_unchecked(i);
+                    ep[l] -= a * xi;
+                    let v = *self.rxv[l].get_unchecked(i) - (pjj * xi + a * zr[l]);
+                    *self.exv[l].get_unchecked_mut(i) = v;
+                    nb[l] = if v.abs() > nb[l] || v.is_nan() { v.abs() } else { nb[l] };
+                }
+            }
         }
         // then the K₀ part, e -= K₀ x
         let ne = match &self.backend {
             Backend::Banded(band) => band.residual_permuted::<NR>(e, x),
             Backend::Direct(_) => {
-                let Ksym = self.KKT.sym_up();
-                let (w0, w1) = (&mut self.w0, &mut self.w1);
-                for l in 0..nlanes {
-                    for i in 0..w0.len() {
-                        w0[i] = x[i][l];
-                        w1[i] = e[i][l];
-                    }
-                    Ksym.symv(w1, w0, -T::one(), T::one());
-                    for i in 0..w1.len() {
-                        e[i][l] = w1[i];
-                    }
-                }
+                symv_lanes_sub(&self.KKT, x, e);
                 lane_norm_inf(e, [T::zero(); NR])
             }
         };
@@ -616,6 +783,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let finite = |s: &Self| {
             s.x.iter().all(|v| v.iter().take(nlanes).all(|t| t.is_finite()))
                 && s.zb.iter().take(nlanes).all(|v| v.iter().all(|t| t.is_finite()))
+                && s.xv.iter().take(nlanes).all(|v| v.iter().all(|t| t.is_finite()))
         };
 
         self.x.copy_from_slice(&self.b);
@@ -623,6 +791,9 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let mut zb = std::mem::take(&mut self.zb);
         self.recover_zb(&self.x, &self.rzb, &mut zb);
         self.zb = zb;
+        let mut xv = std::mem::take(&mut self.xv);
+        self.recover_xv(&self.x, &self.rxv, &mut xv);
+        self.xv = xv;
 
         if !settings.iterative_refinement_enable {
             return finite(self);
@@ -634,7 +805,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
 
         let normb = self.normb;
 
-        let mut norme = self.full_residual(false, nlanes);
+        let mut norme = self.full_residual(false);
         let mut active = [false; NR];
         for l in 0..nlanes {
             if !norme[l].is_finite() {
@@ -663,25 +834,35 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                         let p = self.b_pos[i];
                         self.dx[p][l] = fmadd(self.b_ch[i], self.eb[l][i], self.dx[p][l]);
                     }
+                    for i in 0..self.v_rpos.len() {
+                        let p = self.v_rpos[i];
+                        self.dx[p][l] = fmadd(-self.v_ca[i], self.exv[l][i], self.dx[p][l]);
+                    }
                 }
             }
             Self::reduced_solve(&mut self.backend, &self.KKT, &mut self.dx, nlanes, &mut self.w0, &mut self.w1);
             let mut dzb = std::mem::take(&mut self.dzb);
             self.recover_zb(&self.dx, &self.eb, &mut dzb);
+            let mut dxv = std::mem::take(&mut self.dxv);
+            self.recover_xv(&self.dx, &self.exv, &mut dxv);
             // candidate = current + correction
             for l in 0..nlanes {
                 for (d, z) in dzb[l].iter_mut().zip(&self.zb[l]) {
                     *d += *z;
                 }
+                for (d, v) in dxv[l].iter_mut().zip(&self.xv[l]) {
+                    *d += *v;
+                }
             }
             self.dzb = dzb;
+            self.dxv = dxv;
             for (d, x) in self.dx.iter_mut().zip(self.x.iter()) {
                 for l in 0..nlanes {
                     d[l] += x[l];
                 }
             }
 
-            let newe = self.full_residual(true, nlanes);
+            let newe = self.full_residual(true);
             for l in 0..nlanes {
                 if !active[l] {
                     continue;
@@ -695,6 +876,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                         x[l] = d[l];
                     }
                     self.zb[l].copy_from_slice(&self.dzb[l]);
+                    self.xv[l].copy_from_slice(&self.dxv[l]);
                 }
                 if ratio < stopratio {
                     active[l] = false;
@@ -706,6 +888,40 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         }
         // every accepted iterate had a finite residual, so is finite
         true
+    }
+}
+
+// e -= K x on all lanes, for K symmetric with its upper triangle given,
+// in one pass over K
+fn symv_lanes_sub<T: FloatT>(K: &CscMatrix<T>, x: &[[T; NR]], e: &mut [[T; NR]]) {
+    let n = K.n;
+    assert!(x.len() == n && e.len() == n && K.colptr.len() == n + 1);
+    assert!(K.colptr[n] <= K.rowval.len() && K.colptr[n] <= K.nzval.len());
+    // SAFETY: K is built in new() with every row index below n and
+    // nondecreasing colptr (checked there); lengths are checked above
+    unsafe {
+        for j in 0..n {
+            let xj = *x.get_unchecked(j);
+            let mut acc = [T::zero(); NR];
+            for k in *K.colptr.get_unchecked(j)..*K.colptr.get_unchecked(j + 1) {
+                let i = *K.rowval.get_unchecked(k);
+                let v = *K.nzval.get_unchecked(k);
+                let ei = e.get_unchecked_mut(i);
+                for l in 0..NR {
+                    ei[l] = fmadd(-v, xj[l], ei[l]);
+                }
+                if i != j {
+                    let xi = *x.get_unchecked(i);
+                    for l in 0..NR {
+                        acc[l] = fmadd(v, xi[l], acc[l]);
+                    }
+                }
+            }
+            let ej = e.get_unchecked_mut(j);
+            for l in 0..NR {
+                ej[l] -= acc[l];
+            }
+        }
     }
 }
 
@@ -777,13 +993,26 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                     self.shift[self.b_pos[i] - off] += self.b_coef[i] * ch;
                 }
                 // the largest reduced diagonal, while staging it in the band
-                let mut maxdiag = T::zero();
+                let mut maxdiag = self.v_p.iter().fold(T::zero(), |m, &v| m.max(v.abs()));
                 for (ad, (&k, &d)) in band.a_diag.iter_mut().zip(self.k0_diag.iter().zip(&self.shift)) {
                     *ad = k;
                     let v = (k + d).abs();
                     maxdiag = if v > maxdiag || v.is_nan() { v } else { maxdiag };
                 }
                 let eps = eps_of(maxdiag);
+                let hundred: T = (100.).as_T();
+                let threshold = hundred * settings.static_regularization_constant.max(T::epsilon().sqrt());
+                // eliminated variables: the exact P_jj as pivot, unless it
+                // is small (after a data update), then P_jj + ε
+                for i in 0..self.v_p.len() {
+                    let p = self.v_p[i];
+                    let p = if p > threshold { p } else { p + eps };
+                    let pinv = T::recip(if p > tiny { p } else { tiny });
+                    let ca = self.v_coef[i] * pinv;
+                    self.v_pinv[i] = pinv;
+                    self.v_ca[i] = ca;
+                    self.shift[self.v_rpos[i] - off] -= self.v_coef[i] * ca;
+                }
                 // The banded ordering places every constraint row after its
                 // variables, so its pivot is a Schur complement, and bounded
                 // variables have a positive diagonal term.  First factor
@@ -801,8 +1030,6 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                 {
                     *s = if u { d + rs * eps } else { d };
                 }
-                let hundred: T = (100.).as_T();
-                let threshold = hundred * settings.static_regularization_constant.max(T::epsilon().sqrt());
                 if band.refactor() && band.regularize_count == 0 && band.min_pivot > threshold {
                     return true;
                 }
@@ -819,7 +1046,7 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                 // a²/(H + ε).  The solve (rhs folding and recovery of z_B)
                 // uses the same H + ε, so that it is an exact solve of that
                 // system; refinement measures residuals of the true one.
-                let maxdiag = self.p_diag.iter().chain(self.hs.iter()).fold(T::zero(), |m, &v| m.max(v.abs()));
+                let maxdiag = (self.p_diag.iter().chain(&self.v_p).chain(&self.hs)).fold(T::zero(), |m, &v| m.max(v.abs()));
                 let eps = eps_of(maxdiag);
                 self.shift.fill(T::zero());
                 for i in 0..self.b_h.len() {
@@ -827,6 +1054,15 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                     self.b_hinv[i] = hinv;
                     self.b_ch[i] = self.b_coef[i] * hinv;
                     self.shift[self.b_pos[i] - off] += self.b_coef2[i] * hinv;
+                }
+                // likewise the eliminated variables' diagonal P_jj + ε
+                for i in 0..self.v_p.len() {
+                    let p = self.v_p[i] + eps;
+                    let pinv = T::recip(if p > tiny { p } else { tiny });
+                    let ca = self.v_coef[i] * pinv;
+                    self.v_pinv[i] = pinv;
+                    self.v_ca[i] = ca;
+                    self.shift[self.v_rpos[i] - off] -= self.v_coef[i] * ca;
                 }
                 for (&idx, &v) in self.diag_idx.iter().zip(self.k0_diag.iter()) {
                     self.KKT.nzval[idx] = v;
@@ -853,7 +1089,7 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
         if !self.solve_lanes(1, settings) {
             return false;
         }
-        let (n, m) = (self.x_pos.len(), self.hs.len());
+        let (n, m) = (self.var_pos.len(), self.hs.len());
         match (lhsx, lhsz) {
             (Some(x), Some(z)) => self.expand_lhs::<1>([(x, z)]),
             (x, z) => {
@@ -891,8 +1127,16 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
         for &p in &self.x_pos {
             self.p_diag[p - off] = T::zero();
         }
+        self.v_p.fill(T::zero());
         for j in 0..P.n {
             for k in P.colptr[j]..P.colptr[j + 1] {
+                let e = self.elim_of[j];
+                if e != usize::MAX {
+                    if P.rowval[k] == j {
+                        self.v_p[e] += P.nzval[k];
+                    }
+                    continue;
+                }
                 let kk = self.p_map[k];
                 if kk == usize::MAX {
                     continue;
@@ -900,7 +1144,7 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                 if P.rowval[k] == j {
                     // diagonals are written to K₀ and the factors on the
                     // next update()
-                    self.p_diag[self.x_pos[j] - off] += P.nzval[k];
+                    self.p_diag[self.var_pos[j] - off] += P.nzval[k];
                 } else {
                     self.KKT.nzval[kk] = P.nzval[k];
                     idx.push(kk);
@@ -922,6 +1166,9 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
             let a = A.nzval[self.b_nz[i]];
             self.b_coef[i] = a;
             self.b_coef2[i] = a * a;
+        }
+        for i in 0..self.v_nz.len() {
+            self.v_coef[i] = A.nzval[self.v_nz[i]];
         }
         let mut idx = Vec::with_capacity(self.a_map.len());
         let mut vals = Vec::with_capacity(self.a_map.len());

@@ -6,11 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Version numbering in this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).  We aim to keep the core solver functionality and minor releases in sync between the Rust/Python and Julia implementations.  Small fixes that affect one implementation only may result in the patch release versions differing.
 
-## [Unreleased]
+## [0.11.1+unsquared.1] - 2026-10-09
+
+Release of the Unsquared2 fork; Python wheels are attached to the GitHub release rather than published to PyPI.
 
 ### Changed
 
-- With `direct_solve_method = "auto"` (the default), problems with only zero and nonnegative cones now eliminate simple bound rows (single-entry rows of nonnegative cones) from the KKT system before factoring.  The reduced system is factored with a new banded LDLᵀ when its reverse Cuthill-McKee bandwidth is at most 8 (1D structures such as rods, beams, chains and time-stepped control problems), and with QDLDL otherwise.  Iterative refinement is applied to the full KKT system.  `direct_solve_method = "qdldl"` selects the previous behaviour.
+- With `direct_solve_method = "auto"` (the default), problems with only zero and nonnegative cones now eliminate simple bound rows (single-entry rows of nonnegative cones) from the KKT system before factoring.  The reduced system is factored with a new banded LDLᵀ when its reverse Cuthill-McKee bandwidth is at most 8, or at most 16 where the band costs no more than twice the flops of a sparse factorization (1D structures such as rods, beams, chains and time-stepped control problems), and with QDLDL (or faer, by the usual "auto" rule) otherwise.  Iterative refinement is applied to the full KKT system.  `direct_solve_method = "qdldl"` selects the previous behaviour.
+
+- Auxiliary variables are eliminated as well: variables with a diagonal-only column of P, no bounds, and a single entry in A.  Modelling tools such as CVXPY introduce one for every residual of a least-squares objective (`t = Fx`, minimizing ‖t‖²), and eliminating them keeps such problems as narrow-banded as their direct formulation.
+
+- Python: numpy arrays are converted to Rust vectors in bulk rather than element by element, which takes most of the interface overhead out of setup and data updates.
+
+- Python bindings use pyo3 0.29 (RUSTSEC-2026-0176, RUSTSEC-2026-0177).
 
 - The constant-part and affine-step KKT solves of each iteration are performed together, and the quadratic forms of the Δτ equation are evaluated through cached products, so that each iteration makes one product with P instead of six quadratic forms.
 

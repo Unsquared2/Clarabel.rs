@@ -560,3 +560,211 @@ fn test_data_updates_banded() {
         }
     }
 }
+
+/// the rod as a modelling tool states it: auxiliary variables t = W D w
+/// for the bending energy ½‖t‖², with P = I on t only
+fn rod_lsq(nel: usize, ratio: f64) -> Prob {
+    let n = nel + 1;
+    let nt = n - 2;
+    let h = 1.0 / nel as f64;
+    let P = csc(n + nt, n + nt, (0..nt).map(|i| (n + i, n + i, 1.0)).collect());
+    let mut q: Vec<f64> = (0..n).map(|i| h * (100.0 + if (i as f64 * h - 0.2).abs() < 0.02 { 1e4 } else { 0.0 })).collect();
+    q.resize(n + nt, 0.0);
+    let mut ta = vec![];
+    for (r, &j) in [0, 1, n - 2, n - 1].iter().enumerate() {
+        ta.push((r, j, 1.0));
+    }
+    for i in 1..n - 1 {
+        let x = i as f64 * h;
+        let c = (if (0.3..0.7).contains(&x) { ratio } else { 1.0 } / (h * h * h)).sqrt();
+        let r = 4 + i - 1;
+        ta.push((r, n + i - 1, 1.0));
+        for (k, s) in [(i - 1, 1.0), (i, -2.0), (i + 1, 1.0)] {
+            ta.push((r, k, -c * s));
+        }
+    }
+    let m0 = 4 + nt;
+    for j in 0..n {
+        ta.push((m0 + j, j, -1.0));
+    }
+    let A = csc(m0 + n, n + nt, ta);
+    let mut b = vec![0.0; m0];
+    b.extend((0..n).map(|i| {
+        let x = i as f64 * h;
+        -(-4.0e-3 + 1.2e-2 * (x - 0.45) * (x - 0.45))
+    }));
+    Prob { P, q, A, b, cones: vec![ZeroConeT(m0), NonnegativeConeT(n)] }
+}
+
+/// random feasible least-squares problem: boxed variables x and k
+/// auxiliary variables t with diagonal weights, each in an equality row
+/// t = Fx, an inequality row, a single-entry equality, or sharing that
+/// equality with another auxiliary variable; plus general rows
+fn random_lsq(seed: u64, n: usize, k: usize, lp_x: bool) -> Prob {
+    let mut g = Lcg(seed);
+    let x0: Vec<f64> = (0..n).map(|_| g.n()).collect();
+    let mut tp = vec![];
+    if !lp_x {
+        for _ in 0..n {
+            let (i, j) = ((g.f() * n as f64) as usize, (g.f() * n as f64) as usize);
+            let (a, b) = (g.n(), g.n());
+            tp.push((i, i, a * a));
+            tp.push((j, j, b * b));
+            if i != j {
+                tp.push((i.min(j), i.max(j), a * b));
+            }
+        }
+    }
+    for i in 0..k {
+        tp.push((n + i, n + i, 0.1 + 2.0 * g.f()));
+    }
+    let mut P = csc(n + k, n + k, tp);
+    P.canonicalize().unwrap();
+    let mut q: Vec<f64> = (0..n).map(|_| g.n()).collect();
+    q.resize(n + k, 0.0);
+
+    // rows: (entries, rhs, equality)
+    let mut rows: Vec<(Vec<(usize, f64)>, f64, bool)> = vec![];
+    let dot = |r: &Vec<(usize, f64)>, x: &[f64]| r.iter().map(|&(j, a)| a * x[j]).sum::<f64>();
+    let rand_row = |g: &mut Lcg| {
+        let mut r: Vec<(usize, f64)> = vec![];
+        for _ in 0..3 {
+            let (j, a) = ((g.f() * n as f64) as usize, g.n());
+            match r.iter_mut().find(|e| e.0 == j) {
+                Some(e) => e.1 += a,
+                None => r.push((j, a)),
+            }
+        }
+        r
+    };
+    let mut last_single = None;
+    for i in 0..k {
+        let a = if g.f() < 0.5 { 1.0 } else { 0.2 + 2.0 * g.n() };
+        match i % 4 {
+            0 | 1 => {
+                let mut r = rand_row(&mut g);
+                let v = dot(&r, &x0);
+                r.push((n + i, a));
+                if i % 4 == 0 {
+                    rows.push((r, v + a * g.n(), true));
+                } else {
+                    let t0 = g.n();
+                    rows.push((r, v + a * t0 + g.f(), false));
+                }
+                last_single = None;
+            }
+            2 => {
+                last_single = Some(rows.len());
+                rows.push((vec![(n + i, a)], g.n(), true));
+            }
+            _ => match last_single {
+                Some(ri) => rows[ri].0.push((n + i, a)),
+                None => rows.push((vec![(n + i, a)], g.n(), true)),
+            },
+        }
+    }
+    for _ in 0..n / 3 {
+        let r = rand_row(&mut g);
+        let v = dot(&r, &x0);
+        rows.push((r, v + g.f(), false));
+    }
+    for j in 0..n {
+        rows.push((vec![(j, 1.0)], x0[j] + g.f(), false));
+        rows.push((vec![(j, -1.0)], -x0[j] + g.f(), false));
+    }
+    rows.sort_by_key(|r| !r.2);
+    let neq = rows.iter().filter(|r| r.2).count();
+    let mut t = vec![];
+    for (i, (r, _, _)) in rows.iter().enumerate() {
+        for &(j, a) in r {
+            t.push((i, j, a));
+        }
+    }
+    let A = csc(rows.len(), n + k, t);
+    let b = rows.iter().map(|r| r.1).collect();
+    let mut cones = vec![];
+    if neq > 0 {
+        cones.push(ZeroConeT(neq));
+    }
+    cones.push(NonnegativeConeT(rows.len() - neq));
+    Prob { P, q, A, b, cones }
+}
+
+#[test]
+fn test_aux_variables_rod() {
+    // the auxiliary variables leave the system, so the band is narrow
+    for &(nel, ratio) in &[(6, 1.0), (40, 10.0), (300, 10.0)] {
+        let outs = check_all_paths(&rod_lsq(nel, ratio), 1e-6, &format!("rod_lsq {nel} {ratio}"));
+        let name = &outs[1].solver_name;
+        let kb: usize = name.trim_start_matches("banded(kb=").split(')').next().unwrap().parse().unwrap();
+        assert!(kb <= 3, "{name}");
+        assert_kkt(&rod_lsq(nel, ratio), &outs[1], 1e-6, "rod_lsq kkt");
+    }
+}
+
+#[test]
+fn test_aux_variables_random() {
+    for seed in 0..40 {
+        let (n, k) = (3 + (seed as usize * 5) % 20, 1 + (seed as usize * 3) % 12);
+        let p = random_lsq(seed, n, k, seed % 3 == 0);
+        let outs = check_all_paths(&p, 1e-6, &format!("random_lsq seed {seed} n {n} k {k}"));
+        if is_ok(outs[1].status) {
+            assert_kkt(&p, &outs[1], 1e-6, &format!("random_lsq seed {seed}"));
+        }
+    }
+}
+
+#[test]
+fn test_aux_variables_updates() {
+    // new weights and coefficients, one weight set to zero (that variable
+    // then needs a regularized pivot), on every backend
+    for (p, what) in [(random_lsq(3, 12, 9, false), "random"), (rod_lsq(30, 10.0), "rod")] {
+        let mut g = Lcg(17);
+        let n = p.q.len();
+        let mut P2: Vec<f64> = p.P.nzval.iter().map(|v| v * (1.0 + 0.5 * g.f())).collect();
+        // the last diagonal entry is an auxiliary weight
+        *P2.last_mut().unwrap() = 0.0;
+        let A2: Vec<f64> = p.A.nzval.iter().map(|v| v * (1.0 + 0.1 * g.f())).collect();
+        let q2: Vec<f64> = p.q.iter().map(|v| v * (1.0 + 0.2 * g.f())).collect();
+        assert!(p.P.rowval[p.P.nnz() - 1] == n - 1 && p.P.colptr[n] - p.P.colptr[n - 1] == 1);
+        let mut p2 = Prob { P: p.P.clone(), q: q2.clone(), A: p.A.clone(), b: p.b.clone(), cones: p.cones.clone() };
+        p2.P.nzval = P2.clone();
+        p2.A.nzval = A2.clone();
+        let fresh = solve(&p2, Path::Upstream);
+        for path in [Path::Auto, Path::AutoQdldlBackend, Path::AutoSingleChain] {
+            NO_BANDED.with(|c| c.set(path == Path::AutoQdldlBackend));
+            NO_TWIST.with(|c| c.set(path == Path::AutoSingleChain));
+            let mut solver = DefaultSolver::new(&p.P, &p.q, &p.A, &p.b, &p.cones, settings(path)).unwrap();
+            NO_BANDED.with(|c| c.set(false));
+            NO_TWIST.with(|c| c.set(false));
+            solver.solve();
+            solver.update_P(&P2).unwrap();
+            solver.update_A(&A2).unwrap();
+            solver.update_q(&q2).unwrap();
+            solver.solve();
+            let updated = Out {
+                status: solver.solution.status,
+                s: solver.solution.s.clone(),
+                x: solver.solution.x.clone(),
+                z: solver.solution.z.clone(),
+                obj: solver.solution.obj_val,
+                solver_name: String::new(),
+            };
+            let w = format!("aux updates {what} {path:?}");
+            if is_ok(fresh.status) {
+                assert_close(&updated, &fresh, 1e-6, &w);
+            } else {
+                assert!(is_ok(updated.status), "{w}: {:?}", updated.status);
+                assert_kkt(&p2, &updated, 1e-6, &w);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_aux_variables_small() {
+    // small enough for Miri: every backend, with an auxiliary variable in
+    // each kind of row, and the direct backend's two-lane residual
+    check_all_paths(&rod_lsq(6, 1.0), 1e-6, "rod_lsq 6");
+    check_all_paths(&random_lsq(1, 5, 4, false), 1e-6, "random_lsq small");
+}

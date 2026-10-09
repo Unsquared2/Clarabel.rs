@@ -114,17 +114,66 @@ pub struct BandedLDL<T> {
 /// constraint row, zero diagonal before regularization) moved to just
 /// after its last neighbour so that its pivot is a proper Schur complement
 /// rather than the bare regularization term.   Returns (perm, bandwidth).
+///
+/// Nodes with sign 0 are ordinary nodes that need no placement (rows
+/// whose diagonal is known to be safely nonzero).
 pub fn rcm_ordering<T: FloatT>(K: &CscMatrix<T>, signs: &[i8]) -> (Vec<usize>, usize) {
     let n = K.n;
-    // build full adjacency lists
-    let mut deg = vec![0usize; n];
-    for j in 0..n {
-        for k in K.colptr[j]..K.colptr[j + 1] {
-            let i = K.rowval[k];
-            if i != j {
-                deg[i] += 1;
-                deg[j] += 1;
+    let edges = (0..n).flat_map(|j| (K.colptr[j]..K.colptr[j + 1]).map(move |k| (K.rowval[k], j)));
+    let (ptr, adj) = adjacency(n, edges);
+
+    let bandwidth = |order: &[usize]| -> usize {
+        let mut ip = vec![0usize; n];
+        for (p, &v) in order.iter().enumerate() {
+            ip[v] = p;
+        }
+        (0..n)
+            .flat_map(|v| adj[ptr[v]..ptr[v + 1]].iter().map(move |&w| (v, w)))
+            .map(|(v, w)| ip[v].abs_diff(ip[w]))
+            .max()
+            .unwrap_or(0)
+    };
+
+    // Twisted mode (see BandedLDL) eliminates the bottom half bottom up,
+    // so negative nodes there go before their neighbours.  If the result
+    // is too short for twisted mode, place every node after them instead.
+    // (Placement rarely narrows the band, so twisted mode is not tried
+    // when even the RCM bandwidth is too large for it.)
+    let place = |order: Vec<usize>, bw0: usize| -> (Vec<usize>, usize) {
+        if n >= 4 * bw0.max(1) + 4 {
+            let mut placed = order.clone();
+            place_negative_nodes(&mut placed, signs, &adj, &ptr, true);
+            let bw = bandwidth(&placed);
+            if n >= 4 * bw.max(1) + 4 {
+                return (placed, bw);
             }
+        }
+        let mut placed = order;
+        place_negative_nodes(&mut placed, signs, &adj, &ptr, false);
+        let bw = bandwidth(&placed);
+        (placed, bw)
+    };
+
+    // Placing the negative nodes usually widens the band only slightly, so
+    // when plain RCM is far from banded the matrix goes to a general
+    // sparse solver and the placement is skipped.
+    let order = rcm(&ptr, &adj);
+    let bw0 = bandwidth(&order);
+    if bw0 > 2 * BANDED_MAX_KB {
+        (order, bw0)
+    } else {
+        place(order, bw0)
+    }
+}
+
+// symmetric adjacency lists (ptr, adj) from a list of edges (self loops
+// ignored, no duplicates expected), each list sorted by degree
+fn adjacency(n: usize, edges: impl Iterator<Item = (usize, usize)> + Clone) -> (Vec<usize>, Vec<usize>) {
+    let mut deg = vec![0usize; n];
+    for (i, j) in edges.clone() {
+        if i != j {
+            deg[i] += 1;
+            deg[j] += 1;
         }
     }
     let mut ptr = vec![0usize; n + 1];
@@ -133,15 +182,12 @@ pub fn rcm_ordering<T: FloatT>(K: &CscMatrix<T>, signs: &[i8]) -> (Vec<usize>, u
     }
     let mut fill = ptr.clone();
     let mut adj = vec![0usize; ptr[n]];
-    for j in 0..n {
-        for k in K.colptr[j]..K.colptr[j + 1] {
-            let i = K.rowval[k];
-            if i != j {
-                adj[fill[i]] = j;
-                fill[i] += 1;
-                adj[fill[j]] = i;
-                fill[j] += 1;
-            }
+    for (i, j) in edges {
+        if i != j {
+            adj[fill[i]] = j;
+            fill[i] += 1;
+            adj[fill[j]] = i;
+            fill[j] += 1;
         }
     }
     for i in 0..n {
@@ -150,6 +196,14 @@ pub fn rcm_ordering<T: FloatT>(K: &CscMatrix<T>, signs: &[i8]) -> (Vec<usize>, u
             a.sort_unstable_by_key(|&v| deg[v]);
         }
     }
+    (ptr, adj)
+}
+
+// reverse Cuthill-McKee order of every component, from pseudo-peripheral
+// roots
+fn rcm(ptr: &[usize], adj: &[usize]) -> Vec<usize> {
+    let n = ptr.len() - 1;
+    let deg = |v: usize| ptr[v + 1] - ptr[v];
 
     // BFS from root over unvisited nodes, appending to `order`.  Nodes
     // are marked with `stamp`, so trial sweeps need no clearing.
@@ -197,7 +251,7 @@ pub fn rcm_ordering<T: FloatT>(K: &CscMatrix<T>, signs: &[i8]) -> (Vec<usize>, u
             let first = trial.len() - trial.iter().rev().take_while(|&&v| level[v] == last_level).count();
             root = trial[first..]
                 .iter()
-                .min_by_key(|&&v| deg[v])
+                .min_by_key(|&&v| deg(v))
                 .copied()
                 .unwrap();
         }
@@ -208,39 +262,7 @@ pub fn rcm_ordering<T: FloatT>(K: &CscMatrix<T>, signs: &[i8]) -> (Vec<usize>, u
         }
     }
     order.reverse();
-
-    let bandwidth = |order: &[usize]| -> usize {
-        let mut ip = vec![0usize; n];
-        for (p, &v) in order.iter().enumerate() {
-            ip[v] = p;
-        }
-        (0..n)
-            .flat_map(|v| adj[ptr[v]..ptr[v + 1]].iter().map(move |&w| (v, w)))
-            .map(|(v, w)| ip[v].abs_diff(ip[w]))
-            .max()
-            .unwrap_or(0)
-    };
-
-    // Placing the negative nodes can only widen the band slightly, so
-    // when plain RCM is far from banded the matrix goes to a general
-    // sparse solver and the placement is skipped.
-    let bw0 = bandwidth(&order);
-    if bw0 > 2 * BANDED_MAX_KB {
-        return (order, bw0);
-    }
-
-    // Twisted mode (see BandedLDL) eliminates the bottom half bottom up,
-    // so negative nodes there go before their neighbours.  If the result
-    // is too short for twisted mode, place every node after them instead.
-    let mut placed = order.clone();
-    place_negative_nodes(&mut placed, signs, &adj, &ptr, true);
-    let mut bw = bandwidth(&placed);
-    if n < 4 * bw.max(1) + 4 {
-        placed = order;
-        place_negative_nodes(&mut placed, signs, &adj, &ptr, false);
-        bw = bandwidth(&placed);
-    }
-    (placed, bw)
+    order
 }
 
 /// Move negative nodes (constraint rows, zero diagonal before
