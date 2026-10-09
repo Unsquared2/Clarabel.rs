@@ -16,6 +16,8 @@ Version numbering in this project adheres to [Semantic Versioning](https://semve
 
 - Faster kernels: vectorizable reductions (dot products and norms), sparse matrix-vector products, column norms and scaling, and a division free step length for nonnegative cones.  Results may differ from previous versions in the last digits through a different order of floating point operations.
 
+- The minimum supported Rust version is now 1.71: current releases of the `serde` dependencies no longer build with 1.70.
+
 ### Added
 
 - `examples/rust/example_rod.rs`: a stiff QP (clamped rod resting on an obstacle) used as a benchmark.
