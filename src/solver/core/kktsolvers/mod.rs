@@ -15,6 +15,22 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
     ) -> bool;
     fn update_P(&mut self, P: &CscMatrix<T>);
     fn update_A(&mut self, A: &CscMatrix<T>);
+
+    /// Solve for two right hand sides with the current factorization.
+    /// Solvers able to share work between them may override this.
+    fn solve_pair(
+        &mut self,
+        rhs: [(&[T], &[T]); 2],
+        lhs: [(&mut [T], &mut [T]); 2],
+        settings: &CoreSettings<T>,
+    ) -> bool {
+        let mut ok = true;
+        for ((rx, rz), (lx, lz)) in rhs.into_iter().zip(lhs) {
+            self.setrhs(rx, rz);
+            ok = ok && self.solve(Some(lx), Some(lz), settings);
+        }
+        ok
+    }
 }
 
 pub trait HasLinearSolverInfo {

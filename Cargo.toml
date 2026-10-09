@@ -157,6 +157,10 @@ name = "lp"
 path = "examples/rust/example_lp.rs"
 
 [[example]]
+name = "rod"
+path = "examples/rust/example_rod.rs"
+
+[[example]]
 name = "qp"
 path = "examples/rust/example_qp.rs"
 
@@ -292,3 +296,7 @@ tempfile = "3"
 
 
 
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

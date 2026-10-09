@@ -119,3 +119,15 @@ fn test_isqrt() {
     assert_eq!(2, isqrt(8));
     assert_eq!(3, isqrt(9));
 }
+
+/// a*b + c, fused when the target has hardware FMA.  Without it,
+/// `mul_add` is lowered to a (slow) software fma call, so plain
+/// arithmetic is used instead.
+#[inline(always)]
+pub(crate) fn fmadd<T: FloatT>(a: T, b: T, c: T) -> T {
+    if cfg!(target_feature = "fma") {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}

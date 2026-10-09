@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Version numbering in this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).  We aim to keep the core solver functionality and minor releases in sync between the Rust/Python and Julia implementations.  Small fixes that affect one implementation only may result in the patch release versions differing.
 
+## [Unreleased]
+
+### Changed
+
+- With `direct_solve_method = "auto"` (the default), problems with only zero and nonnegative cones now eliminate simple bound rows (single-entry rows of nonnegative cones) from the KKT system before factoring.  The reduced system is factored with a new banded LDLᵀ when its reverse Cuthill-McKee bandwidth is at most 8 (1D structures such as rods, beams, chains and time-stepped control problems), and with QDLDL otherwise.  Iterative refinement is applied to the full KKT system.  `direct_solve_method = "qdldl"` selects the previous behaviour.
+
+- The constant-part and affine-step KKT solves of each iteration are performed together, and the quadratic forms of the Δτ equation are evaluated through cached products, so that each iteration makes one product with P instead of six quadratic forms.
+
+- Faster kernels: vectorizable reductions (dot products and norms), sparse matrix-vector products, column norms and scaling, and a division free step length for nonnegative cones.  Results may differ from previous versions in the last digits through a different order of floating point operations.
+
+### Added
+
+- `examples/rust/example_rod.rs`: a stiff QP (clamped rod resting on an obstacle) used as a benchmark.
+
 ## [0.11.1] - 2025-11-06
 
 ### Rust-specific changes
