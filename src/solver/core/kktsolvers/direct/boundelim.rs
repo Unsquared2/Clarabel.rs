@@ -46,6 +46,7 @@
 //! (QDLDL, or faer for heavy factorizations when that feature is enabled).  Vectors are kept in the backend's (permuted) ordering.
 
 use super::banded::*;
+use super::schur::SchurLDL;
 use crate::algebra::*;
 use super::ldlsolvers::amd_order;
 use super::ldlsolvers::qdldl::QDLDLDirectLDLSolver;
@@ -63,6 +64,7 @@ const DUP_DIAG: usize = usize::MAX - 1;
 enum Backend<T> {
     Direct(BoxedDirectLDLSolver<T>),
     Banded(Box<BandedLDL<T>>),
+    Schur(Box<SchurLDL<T>>),
 }
 
 pub struct BoundElimKKTSolver<T> {
@@ -152,9 +154,18 @@ pub struct BoundElimKKTSolver<T> {
     xv: [Vec<T>; NR],
     exv: [Vec<T>; NR],
     dxv: [Vec<T>; NR],
-    // scalar work for the general sparse backend
+    // scalar work for the general sparse backend, lanes for the Schur one
     w0: Vec<T>,
     w1: Vec<T>,
+    sw: Vec<[T; NR]>,
+    // diagonal values for the factorization (sparse and Schur backends)
+    kvals: Vec<T>,
+    // Schur backend: whether the current factors are of the unregularized
+    // system, and the ε of the regularized one
+    schur_exact: bool,
+    schur_eps: T,
+    // whether the last solve_lanes() met the refinement tolerance
+    ir_converged: bool,
     // inf norm of the full rhs per lane, set by reduce_rhs
     normb: [T; NR],
 }
@@ -384,6 +395,8 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
             let iperm = band.iperm.clone();
             let kb = band.kb;
             (Backend::Banded(Box::new(band)), band_map, iperm, dim + 2 * kb, kb)
+        } else if let Some(schur) = schur_backend(&KKT, nr, |j| p_diag_nat[j] > T::zero() || has_bound[j], settings) {
+            (Backend::Schur(Box::new(schur)), vec![], (0..dim).collect(), dim, 0)
         } else {
             // Order with AMD on the pattern of the full KKT system, as
             // the full solver does, and drop the bound rows from that
@@ -437,7 +450,8 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         let b_coef2 = b_coef.iter().map(|&a| a * a).collect();
         let zl = [T::zero(); NR];
         let lane = |len: usize| -> [Vec<T>; NR] { std::array::from_fn(|_| vec![T::zero(); len]) };
-        let wlen = if use_banded { 0 } else { dim };
+        let wlen = if matches!(backend, Backend::Direct(_)) { dim } else { 0 };
+        let mr_schur = if let Backend::Schur(s) = &backend { s.mr } else { 0 };
         let nv = v_var.len();
         let mut s = Self {
             v_var,
@@ -491,6 +505,11 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
             dzb: lane(nb),
             w0: vec![T::zero(); wlen],
             w1: vec![T::zero(); wlen],
+            sw: vec![zl; mr_schur],
+            kvals: vec![T::zero(); dim],
+            schur_exact: false,
+            schur_eps: T::zero(),
+            ir_converged: true,
             normb: [T::zero(); NR],
         };
         s.check_indices(m);
@@ -664,9 +683,11 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         nlanes: usize,
         w0: &mut [T],
         w1: &mut [T],
+        sw: &mut [[T; NR]],
     ) {
         match backend {
             Backend::Banded(band) => band.solve_permuted::<NR>(v),
+            Backend::Schur(s) => s.solve::<NR>(v, sw, nlanes),
             Backend::Direct(ldl) => {
                 for l in 0..nlanes {
                     for (wi, vi) in w0.iter_mut().zip(v.iter()) {
@@ -718,7 +739,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
     // and remaining rows, backend order), eb (eliminated rows) and exv
     // (eliminated variables).  Returns its inf norm per lane (NaN if it
     // has any).
-    fn full_residual(&mut self, use_dx: bool) -> [T; NR] {
+    fn full_residual(&mut self, use_dx: bool, nlanes: usize) -> [T; NR] {
         let (x, zb) = if use_dx { (&self.dx, &self.dzb) } else { (&self.x, &self.zb) };
         let xv = if use_dx { &self.dxv } else { &self.xv };
         let e = &mut self.e;
@@ -763,9 +784,14 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
             }
         }
         // then the K₀ part, e -= K₀ x
-        let ne = match &self.backend {
+        let ne = match &mut self.backend {
             Backend::Banded(band) => band.residual_permuted::<NR>(e, x),
-            Backend::Direct(_) => {
+            Backend::Schur(s) if s.is_dense() => {
+                // K₀ = [diag(P) A_R'; A_R -H_R], held by the factorization
+                s.residual_sub::<NR>(e, x, &self.k0_diag, nlanes);
+                lane_norm_inf(e, [T::zero(); NR])
+            }
+            Backend::Direct(_) | Backend::Schur(_) => {
                 symv_lanes_sub(&self.KKT, x, e);
                 lane_norm_inf(e, [T::zero(); NR])
             }
@@ -780,6 +806,24 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
     // Solve all lanes of the system whose rhs was set by reduce_rhs, with
     // iterative refinement on the full system.
     fn solve_lanes(&mut self, nlanes: usize, settings: &CoreSettings<T>) -> bool {
+        let ok = self.solve_lanes_once(nlanes, settings);
+        // An exact Schur factorization whose solve does not refine to the
+        // tolerance (badly scaled problems): switch to the regularized one
+        // for the rest of this iteration and solve again.
+        if self.schur_exact && !(ok && self.ir_converged) {
+            self.schur_exact = false;
+            self.fold(self.schur_eps);
+            if !self.schur_factor().0 {
+                return false;
+            }
+            self.refold_rhs();
+            return self.solve_lanes_once(nlanes, settings);
+        }
+        ok
+    }
+
+    fn solve_lanes_once(&mut self, nlanes: usize, settings: &CoreSettings<T>) -> bool {
+        self.ir_converged = true;
         let finite = |s: &Self| {
             s.x.iter().all(|v| v.iter().take(nlanes).all(|t| t.is_finite()))
                 && s.zb.iter().take(nlanes).all(|v| v.iter().all(|t| t.is_finite()))
@@ -787,7 +831,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
         };
 
         self.x.copy_from_slice(&self.b);
-        Self::reduced_solve(&mut self.backend, &self.KKT, &mut self.x, nlanes, &mut self.w0, &mut self.w1);
+        Self::reduced_solve(&mut self.backend, &self.KKT, &mut self.x, nlanes, &mut self.w0, &mut self.w1, &mut self.sw);
         let mut zb = std::mem::take(&mut self.zb);
         self.recover_zb(&self.x, &self.rzb, &mut zb);
         self.zb = zb;
@@ -805,7 +849,9 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
 
         let normb = self.normb;
 
-        let mut norme = self.full_residual(false);
+        let mut norme = self.full_residual(false, nlanes);
+        // residual of the accepted iterate
+        let mut best = norme;
         let mut active = [false; NR];
         for l in 0..nlanes {
             if !norme[l].is_finite() {
@@ -840,7 +886,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                     }
                 }
             }
-            Self::reduced_solve(&mut self.backend, &self.KKT, &mut self.dx, nlanes, &mut self.w0, &mut self.w1);
+            Self::reduced_solve(&mut self.backend, &self.KKT, &mut self.dx, nlanes, &mut self.w0, &mut self.w1, &mut self.sw);
             let mut dzb = std::mem::take(&mut self.dzb);
             self.recover_zb(&self.dx, &self.eb, &mut dzb);
             let mut dxv = std::mem::take(&mut self.dxv);
@@ -862,7 +908,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                 }
             }
 
-            let newe = self.full_residual(true);
+            let newe = self.full_residual(true, nlanes);
             for l in 0..nlanes {
                 if !active[l] {
                     continue;
@@ -872,6 +918,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                 }
                 let ratio = norme[l] / newe[l];
                 if ratio > T::one() {
+                    best[l] = newe[l];
                     for (x, d) in self.x.iter_mut().zip(self.dx.iter()) {
                         x[l] = d[l];
                     }
@@ -886,6 +933,7 @@ impl<T: FloatT> BoundElimKKTSolver<T> {
                 }
             }
         }
+        self.ir_converged = (0..nlanes).all(|l| best[l] <= abstol + reltol * normb[l]);
         // every accepted iterate had a finite residual, so is finite
         true
     }
@@ -946,6 +994,13 @@ impl<T: FloatT> HasLinearSolverInfo for BoundElimKKTSolver<T> {
                 info.name = format!("{}+boundelim", info.name);
                 info
             }
+            Backend::Schur(s) => LinearSolverInfo {
+                name: format!("schur(m={})+boundelim", s.mr),
+                threads: 1,
+                direct: true,
+                nnzA: self.KKT.nnz(),
+                nnzL: s.mr * (s.mr + 1) / 2,
+            },
             Backend::Banded(b) => LinearSolverInfo {
                 name: format!("banded(kb={})+boundelim", b.kb),
                 threads: 1,
@@ -1038,7 +1093,7 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                 }
                 band.refactor()
             }
-            Backend::Direct(ldl) => {
+            Backend::Direct(_) => {
                 // Factor the reduced form of exactly the regularized full
                 // KKT matrix: ε sized as in the full solver (from its
                 // diagonal: P_jj, and -H for every constraint row), and the
@@ -1046,32 +1101,33 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
                 // a²/(H + ε).  The solve (rhs folding and recovery of z_B)
                 // uses the same H + ε, so that it is an exact solve of that
                 // system; refinement measures residuals of the true one.
-                let maxdiag = (self.p_diag.iter().chain(&self.v_p).chain(&self.hs)).fold(T::zero(), |m, &v| m.max(v.abs()));
-                let eps = eps_of(maxdiag);
-                self.shift.fill(T::zero());
-                for i in 0..self.b_h.len() {
-                    let hinv = T::recip(self.b_h[i] + eps);
-                    self.b_hinv[i] = hinv;
-                    self.b_ch[i] = self.b_coef[i] * hinv;
-                    self.shift[self.b_pos[i] - off] += self.b_coef2[i] * hinv;
-                }
-                // likewise the eliminated variables' diagonal P_jj + ε
-                for i in 0..self.v_p.len() {
-                    let p = self.v_p[i] + eps;
-                    let pinv = T::recip(if p > tiny { p } else { tiny });
-                    let ca = self.v_coef[i] * pinv;
-                    self.v_pinv[i] = pinv;
-                    self.v_ca[i] = ca;
-                    self.shift[self.v_rpos[i] - off] -= self.v_coef[i] * ca;
-                }
-                for (&idx, &v) in self.diag_idx.iter().zip(self.k0_diag.iter()) {
-                    self.KKT.nzval[idx] = v;
-                }
-                let vals: Vec<T> = (0..self.k0_diag.len())
-                    .map(|i| self.k0_diag[i] + self.shift[i] + self.reg_sign[i] * eps)
-                    .collect();
-                ldl.update_values(&self.diag_idx, &vals);
+                let eps = eps_of(self.regularization_scale());
+                self.fold(eps);
+                let Backend::Direct(ldl) = &mut self.backend else { unreachable!() };
+                ldl.update_values(&self.diag_idx, &self.kvals);
                 ldl.refactor(&self.KKT)
+            }
+            Backend::Schur(_) => {
+                // As for the sparse backend, but first with ε = 0, since
+                // all the variables have a positive diagonal (P_jj > 0 or a
+                // bound).  Solving the exact system saves the refinement
+                // step that the O(ε) perturbation needs on every solve.
+                // Small or replaced pivots, and any solve that does not
+                // refine to the tolerance (see solve_lanes), fall back to
+                // the regularized system.
+                let eps = eps_of(self.regularization_scale());
+                self.schur_eps = eps;
+                if settings.iterative_refinement_enable {
+                    self.fold(T::zero());
+                    let (ok, safe) = self.schur_factor();
+                    if ok && safe {
+                        self.schur_exact = true;
+                        return true;
+                    }
+                }
+                self.schur_exact = false;
+                self.fold(eps);
+                self.schur_factor().0
             }
         }
     }
@@ -1170,6 +1226,9 @@ impl<T: FloatT> KKTSolver<T> for BoundElimKKTSolver<T> {
         for i in 0..self.v_nz.len() {
             self.v_coef[i] = A.nzval[self.v_nz[i]];
         }
+        if let Backend::Schur(s) = &mut self.backend {
+            s.invalidate_values();
+        }
         let mut idx = Vec::with_capacity(self.a_map.len());
         let mut vals = Vec::with_capacity(self.a_map.len());
         for &(k, kk) in &self.a_map {
@@ -1249,4 +1308,124 @@ fn direct_ldl<T: FloatT>(
     }
     let _ = info;
     Box::new(QDLDLDirectLDLSolver::<T>::new(KKT, signs, settings, Some(perm)))
+}
+
+// The dense Schur complement backend, if the reduced system suits it: no
+// off-diagonal entries of P among the remaining variables (each variable
+// column of K₀ holds only its diagonal), every one of them with a positive
+// diagonal term (`pos_diag`: P_jj > 0 or a bound), and a dense factor of the rows'
+// Schur complement that costs no more than about twice forming it (which
+// any elimination of the variables first must do), or few rows anyway.
+fn schur_backend<T: FloatT>(
+    KKT: &CscMatrix<T>,
+    nr: usize,
+    pos_diag: impl Fn(usize) -> bool,
+    settings: &CoreSettings<T>,
+) -> Option<SchurLDL<T>> {
+    const SCHUR_MAX_M: usize = 1000;
+    const SCHUR_SMALL_M: usize = 48;
+    let dim = KKT.n;
+    let mr = dim - nr;
+    if test_hooks::no_schur() || mr == 0 || mr > SCHUR_MAX_M {
+        return None;
+    }
+    if (0..nr).any(|j| KKT.colptr[j + 1] - KKT.colptr[j] != 1 || !pos_diag(j)) {
+        return None;
+    }
+    // A by variable, from the row columns of K₀ (their off-diagonals)
+    let mut cols: Vec<Vec<(usize, usize)>> = vec![vec![]; nr];
+    for r in 0..mr {
+        for k in KKT.colptr[nr + r]..KKT.colptr[nr + r + 1] {
+            let i = KKT.rowval[k];
+            if i < nr {
+                cols[i].push((r, k));
+            }
+        }
+    }
+    let form: f64 = cols.iter().map(|c| (c.len() * (c.len() + 1) / 2) as f64).sum();
+    let cube = (mr as f64).powi(3) / 3.0;
+    if mr > SCHUR_SMALL_M && cube > 2.0 * form {
+        return None;
+    }
+    Some(SchurLDL::new(
+        nr,
+        mr,
+        &cols,
+        settings.dynamic_regularization_eps,
+        settings.dynamic_regularization_delta,
+    ))
+}
+
+impl<T: FloatT> BoundElimKKTSolver<T> {
+    // the largest diagonal of the full KKT system, for sizing ε
+    fn regularization_scale(&self) -> T {
+        (self.p_diag.iter().chain(&self.v_p).chain(&self.hs)).fold(T::zero(), |m, &v| m.max(v.abs()))
+    }
+
+    // Diagonal values to factor (into kvals), and the coefficients that
+    // fold the eliminated rows and variables into the reduced rhs, for the
+    // full system with every diagonal regularized by ε = e (sparse and
+    // Schur backends, whose positions are natural).  Also sets K₀'s
+    // diagonal.
+    fn fold(&mut self, e: T) {
+        let tiny = T::min_positive_value().sqrt();
+        for (&idx, &v) in self.diag_idx.iter().zip(self.k0_diag.iter()) {
+            self.KKT.nzval[idx] = v;
+        }
+        self.shift.fill(T::zero());
+        for i in 0..self.b_h.len() {
+            let hinv = T::recip(self.b_h[i] + e);
+            self.b_hinv[i] = hinv;
+            self.b_ch[i] = self.b_coef[i] * hinv;
+            self.shift[self.b_pos[i]] += self.b_coef2[i] * hinv;
+        }
+        // likewise the eliminated variables' diagonal P_jj + ε
+        for i in 0..self.v_p.len() {
+            let p = self.v_p[i] + e;
+            let pinv = T::recip(if p > tiny { p } else { tiny });
+            let ca = self.v_coef[i] * pinv;
+            self.v_pinv[i] = pinv;
+            self.v_ca[i] = ca;
+            self.shift[self.v_rpos[i]] -= self.v_coef[i] * ca;
+        }
+        for i in 0..self.kvals.len() {
+            self.kvals[i] = self.k0_diag[i] + self.shift[i] + self.reg_sign[i] * e;
+        }
+    }
+
+    // Factor kvals with the Schur backend: (finite, no small or replaced
+    // pivot).  "Small" is relative to S's largest diagonal and stricter
+    // than numerical safety alone would need: when S is that close to
+    // singular, the regularized system's damping of its near null space
+    // matters to the interior point iterations (badly scaled problems
+    // reached wrong verdicts with exact solves that refined fine).
+    fn schur_factor(&mut self) -> (bool, bool) {
+        let Backend::Schur(s) = &mut self.backend else { unreachable!() };
+        // positions are natural: variables, then rows, whose diagonal is -G
+        let nr = s.nr;
+        let vals = &mut self.kvals;
+        vals[nr..].iter_mut().for_each(|v| *v = -*v);
+        let ok = s.factor(&vals[..nr], &vals[nr..], &self.KKT.nzval);
+        let safe = s.regularize_count == 0 && s.min_pivot_ratio() > (1e-6).as_T();
+        (ok, safe)
+    }
+
+    // Rebuild the reduced rhs from the K₀ rhs and the eliminated parts of
+    // the full rhs, after the folding coefficients changed
+    fn refold_rhs(&mut self) {
+        self.b.copy_from_slice(&self.b0);
+        for (&j, &p) in self.x_var.iter().zip(&self.x_pos) {
+            for i in self.bptr[j]..self.bptr[j + 1] {
+                for l in 0..NR {
+                    self.b[p][l] = fmadd(self.b_ch[i], self.rzb[l][i], self.b[p][l]);
+                }
+            }
+        }
+        for e in 0..self.v_var.len() {
+            let p = self.v_rpos[e];
+            for l in 0..NR {
+                self.b[p][l] = fmadd(-self.v_ca[e], self.rxv[l][e], self.b[p][l]);
+            }
+        }
+    }
 }
