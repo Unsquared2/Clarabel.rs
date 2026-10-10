@@ -73,8 +73,7 @@ where
         let sz = variables.s.dot(&variables.z);
 
         //Px = P*x, P treated as symmetric
-        let symP = data.P.sym_up();
-        symP.symv(&mut self.Px, &variables.x, T::one(), T::zero());
+        data.P_mul(&mut self.Px, &variables.x);
 
         let xPx = variables.x.dot(&self.Px);
 
@@ -108,5 +107,9 @@ where
         self.dot_bz = bz;
         self.dot_sz = sz;
         self.dot_xPx = xPx;
+    }
+
+    fn Px(&self) -> Option<&[T]> {
+        Some(&self.Px)
     }
 }

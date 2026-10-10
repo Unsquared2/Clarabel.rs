@@ -103,6 +103,7 @@ where
         let d = &self.data.equilibration.d;
         let c = self.data.equilibration.c;
         data.update_matrix(&mut self.data.P, d, d, Some(c))?;
+        self.data.refresh_P_full();
         // overwrite KKT data
         self.kktsystem.update_P(&self.data.P);
         Ok(())

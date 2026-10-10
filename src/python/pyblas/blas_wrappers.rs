@@ -7,7 +7,7 @@ use lazy_static::lazy_static;
 use libc::c_char;
 
 lazy_static! {
-    static ref PYBLAS: PyBlasPointers = pyo3::Python::with_gil(|py| {
+    static ref PYBLAS: PyBlasPointers = pyo3::Python::attach(|py| {
         PyBlasPointers::new(py).expect("Failed to load SciPy BLAS bindings.")
     });
 }

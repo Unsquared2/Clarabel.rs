@@ -8,6 +8,7 @@
 //! source.   See the [Python Installation Documentation](https://oxfordcontrol.github.io/ClarabelDocs/stable/python/installation_py/).
 //!
 
+mod array_py;
 mod cones_py;
 mod cscmatrix_py;
 mod impl_default_py;
@@ -24,6 +25,7 @@ pub(crate) mod pyblas;
 // is made public so that we can force the docstring above to appear
 // in the API documentation and give the link.
 
+pub(crate) use array_py::*;
 pub(crate) use cones_py::*;
 pub(crate) use cscmatrix_py::*;
 pub(crate) use impl_default_py::*;

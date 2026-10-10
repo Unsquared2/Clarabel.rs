@@ -1,9 +1,9 @@
 [package]
 name = "clarabel"
-version = "0.11.1"
+version = "0.11.1+unsquared.1"
 authors = ["Paul Goulart <paul.goulart@eng.ox.ac.uk>"]
 edition = "2021"
-rust-version = "1.70.0"
+rust-version = "1.71.0"
 license = "Apache-2.0"
 description = "Clarabel Conic Interior Point Solver for Rust / Python"
 readme = "README.md"
@@ -157,6 +157,10 @@ name = "lp"
 path = "examples/rust/example_lp.rs"
 
 [[example]]
+name = "rod"
+path = "examples/rust/example_rod.rs"
+
+[[example]]
 name = "qp"
 path = "examples/rust/example_qp.rs"
 
@@ -244,7 +248,7 @@ version = "0.2"
 
 [dependencies.pyo3]
 optional = true
-version = "0.25"
+version = "0.29"
 # "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
 # "abi3-py39" tells pyo3 (and maturin) to build using the stable ABI with minimum Python version 3.9
 features = ["extension-module", "abi3-py39"]
@@ -292,3 +296,7 @@ tempfile = "3"
 
 
 
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

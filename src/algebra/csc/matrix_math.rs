@@ -49,12 +49,11 @@ impl<T: FloatT> MatrixMath<T> for CscMatrix<T> {
         assert_eq!(norms.len(), self.colptr.len() - 1);
 
         for (i, v) in norms.iter_mut().enumerate() {
-            *v = self
-                .nzval
-                .iter()
-                .take(self.colptr[i + 1])
-                .skip(self.colptr[i])
-                .fold(*v, |m, &nzval| T::max(m, T::abs(nzval)));
+            let mut m = *v;
+            for &nzval in &self.nzval[self.colptr[i]..self.colptr[i + 1]] {
+                m = max_ignore_nan(m, T::abs(nzval));
+            }
+            *v = m;
         }
     }
 
@@ -66,13 +65,18 @@ impl<T: FloatT> MatrixMath<T> for CscMatrix<T> {
     fn col_norms_sym_no_reset(&self, norms: &mut [T]) {
         assert_eq!(norms.len(), self.colptr.len() - 1);
 
-        for i in 0..norms.len() {
-            for j in self.colptr[i]..self.colptr[i + 1] {
-                let tmp = T::abs(self.nzval[j]);
-                let r = self.rowval[j];
-                norms[i] = T::max(norms[i], tmp);
-                norms[r] = T::max(norms[r], tmp);
+        let n = norms.len();
+        for i in 0..n {
+            let (first, last) = (self.colptr[i], self.colptr[i + 1]);
+            let mut m = norms[i];
+            for (&r, &v) in zip(&self.rowval[first..last], &self.nzval[first..last]) {
+                let tmp = T::abs(v);
+                m = max_ignore_nan(m, tmp);
+                if r != i {
+                    norms[r] = max_ignore_nan(norms[r], tmp);
+                }
             }
+            norms[i] = m;
         }
     }
 
@@ -84,8 +88,12 @@ impl<T: FloatT> MatrixMath<T> for CscMatrix<T> {
     fn row_norms_no_reset(&self, norms: &mut [T]) {
         assert_eq!(self.rowval.len(), *self.colptr.last().unwrap());
 
-        for (row, val) in zip(&self.rowval, &self.nzval) {
-            norms[*row] = T::max(norms[*row], T::abs(*val));
+        let m = norms.len();
+        for (&row, val) in zip(&self.rowval, &self.nzval) {
+            assert!(row < m);
+            // SAFETY: row < m checked above
+            let nr = unsafe { norms.get_unchecked_mut(row) };
+            *nr = max_ignore_nan(*nr, T::abs(*val));
         }
     }
 }
@@ -101,8 +109,11 @@ impl<T: FloatT> MatrixMathMut<T> for CscMatrix<T> {
     }
 
     fn lscale(&mut self, l: &[T]) {
-        for (val, row) in zip(&mut self.nzval, &self.rowval) {
-            *val *= l[*row];
+        let m = l.len();
+        for (val, &row) in zip(&mut self.nzval, &self.rowval) {
+            assert!(row < m);
+            // SAFETY: row < m checked above
+            *val *= unsafe { *l.get_unchecked(row) };
         }
     }
 
@@ -124,14 +135,18 @@ impl<T: FloatT> MatrixMathMut<T> for CscMatrix<T> {
             let vals = &mut self.nzval[first..last];
             let rows = &self.rowval[first..last];
 
-            for (val, row) in zip(vals, rows) {
-                *val *= l[*row] * ri;
+            let m = l.len();
+            for (val, &row) in zip(vals, rows) {
+                assert!(row < m);
+                // SAFETY: row < m checked above
+                *val *= unsafe { *l.get_unchecked(row) } * ri;
             }
         }
     }
 }
 
 #[allow(non_snake_case)]
+#[allow(dead_code)]
 fn _csc_symv_safe<T: FloatT>(
     A: &CscMatrix<T>,
     _uplo: MatrixTriangle,
@@ -166,14 +181,6 @@ fn _csc_symv_safe<T: FloatT>(
     }
 }
 
-// Safety: The function below checks that x and y are compatible with
-// the dimensions of A, so safety is assured so long as the the matrix
-// A as rowval and colptr arrays that are consistent with its dimension.
-// A bounds checked version is provided above.
-//
-// This `unsafe`d version is preferred to the multiplication K*x, with K
-// the symmetric KKT matrix, and is used heavily in iterative refinement of
-// direct linear solves.
 #[allow(non_snake_case)]
 fn _csc_symv_unsafe<T: FloatT>(
     A: &CscMatrix<T>,
@@ -191,18 +198,26 @@ fn _csc_symv_unsafe<T: FloatT>(
     assert!(x.len() == A.n);
     assert!(y.len() == A.n);
     assert!(A.n == A.m);
+    assert!(A.colptr.len() == A.n + 1);
+    assert!(A.rowval.len() >= A.colptr[A.n] && A.nzval.len() >= A.colptr[A.n]);
+    // The column's contribution through the transpose is accumulated in a
+    // register rather than through memory, and the diagonal is masked
+    // branch-free so it is not counted twice.
     unsafe {
-        for (col, &xcol) in x.iter().enumerate() {
+        for col in 0..A.n {
             let first = *A.colptr.get_unchecked(col);
             let last = *A.colptr.get_unchecked(col + 1);
-
-            for (&row, &Aij) in zip(&A.rowval[first..last], &A.nzval[first..last]) {
-                *y.get_unchecked_mut(row) += a * Aij * xcol;
-                if row != col {
-                    //don't double up on the diagonal
-                    *y.get_unchecked_mut(col) += a * Aij * (*x.get_unchecked(row));
-                }
+            let xcol = a * *x.get_unchecked(col);
+            let mut acc = T::zero();
+            for k in first..last {
+                let row = *A.rowval.get_unchecked(k);
+                let Aij = *A.nzval.get_unchecked(k);
+                debug_assert!(row < A.n);
+                *y.get_unchecked_mut(row) += Aij * xcol;
+                let t = Aij * *x.get_unchecked(row);
+                acc += if row != col { t } else { T::zero() };
             }
+            *y.get_unchecked_mut(col) += a * acc;
         }
     }
 }
@@ -278,23 +293,12 @@ fn _csc_axpby_N<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     assert_eq!(x.len(), A.n);
 
     //y += A*x
-    if a == T::one() {
-        for (j, xj) in x.iter().enumerate().take(A.n) {
-            for i in A.colptr[j]..A.colptr[j + 1] {
-                y[A.rowval[i]] += A.nzval[i] * *xj;
-            }
-        }
-    } else if a == -T::one() {
-        for (j, xj) in x.iter().enumerate().take(A.n) {
-            for i in A.colptr[j]..A.colptr[j + 1] {
-                y[A.rowval[i]] -= A.nzval[i] * *xj;
-            }
-        }
-    } else {
-        for (j, xj) in x.iter().enumerate().take(A.n) {
-            for i in A.colptr[j]..A.colptr[j + 1] {
-                y[A.rowval[i]] += a * A.nzval[i] * *xj;
-            }
+    assert_eq!(y.len(), A.m);
+    for (j, &xj) in x.iter().enumerate().take(A.n) {
+        let xj = a * xj;
+        let (first, last) = (A.colptr[j], A.colptr[j + 1]);
+        for (&row, &v) in zip(&A.rowval[first..last], &A.nzval[first..last]) {
+            y[row] += v * xj;
         }
     }
 }
@@ -320,25 +324,15 @@ fn _csc_axpby_T<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     assert_eq!(A.nzval.len(), *A.colptr.last().unwrap());
     assert_eq!(x.len(), A.m);
 
-    //y += A*x
-    if a == T::one() {
-        for (j, yj) in y.iter_mut().enumerate().take(A.n) {
-            for k in A.colptr[j]..A.colptr[j + 1] {
-                *yj += A.nzval[k] * x[A.rowval[k]];
-            }
+    //y += A'*x
+    assert_eq!(y.len(), A.n);
+    for (j, yj) in y.iter_mut().enumerate() {
+        let (first, last) = (A.colptr[j], A.colptr[j + 1]);
+        let mut acc = T::zero();
+        for (&row, &v) in zip(&A.rowval[first..last], &A.nzval[first..last]) {
+            acc += v * x[row];
         }
-    } else if a == -T::one() {
-        for (j, yj) in y.iter_mut().enumerate().take(A.n) {
-            for k in A.colptr[j]..A.colptr[j + 1] {
-                *yj -= A.nzval[k] * x[A.rowval[k]];
-            }
-        }
-    } else {
-        for (j, yj) in y.iter_mut().enumerate().take(A.n) {
-            for k in A.colptr[j]..A.colptr[j + 1] {
-                *yj += a * A.nzval[k] * x[A.rowval[k]];
-            }
-        }
+        *yj += a * acc;
     }
 }
 
@@ -372,4 +366,15 @@ fn test_symv_safe_and_unsafe() {
     let mut y = vec![0., 1., -1., 2.];
     _csc_symv_safe(&Alo, MatrixTriangle::Tril, &mut y, &x, a, b);
     assert_eq!(y, vec![46.0, -29.0, -25.0, -4.0]);
+}
+
+// max(m, v) for an accumulator m that is never NaN: as T::max, a NaN v is
+// ignored, but this compiles to a single compare-select
+#[inline(always)]
+fn max_ignore_nan<T: FloatT>(m: T, v: T) -> T {
+    if v > m {
+        v
+    } else {
+        m
+    }
 }

@@ -341,33 +341,29 @@ where
             //iterations that produce a KKT update
             iter += 1;
 
-            // Update the KKT system and the constant parts of its solution.
-            // Keep track of the success of each step that calls KKT
+            // Update the KKT system and the constant parts of its solution,
+            // and calculate the affine step.  The affine RHS depends only
+            // on the residuals and the (already updated) cone scalings, so
+            // it is formed first to let the KKT system solve both at once.
             // --------------
             //PJG: This should be a Result in Rust, but needs changes down
             //into the KKT solvers to do that.
             let mut is_kkt_solve_success : bool;
-            timeit!{timers => "kkt update"; {
-                is_kkt_solve_success = self.kktsystem.update(&self.data, &self.cones, &self.settings);
-            }} // end "kkt update" timer
-
-            // calculate the affine step
-            // --------------
             self.step_rhs
                 .affine_step_rhs(&self.residuals, &self.variables, &self.cones);
 
-            timeit!{timers => "kkt solve"; {
-                is_kkt_solve_success = is_kkt_solve_success &&
-                self.kktsystem.solve(
+            self.kktsystem.set_Px_hint(self.residuals.Px());
+            timeit!{timers => "kkt update+affine"; {
+                let (_, ok) = self.kktsystem.update_and_solve_affine(
                     &mut self.step_lhs,
                     &self.step_rhs,
                     &self.data,
                     &self.variables,
                     &mut self.cones,
-                    StepDirection::Affine,
                     &self.settings,
                 );
-            }}  //end "kkt solve affine" timer
+                is_kkt_solve_success = ok;
+            }}
 
             // combined step only on affine step success
             if is_kkt_solve_success {

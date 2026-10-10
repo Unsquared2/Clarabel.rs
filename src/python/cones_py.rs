@@ -160,8 +160,11 @@ impl From<PySupportedCone> for SupportedConeT<f64> {
     }
 }
 
-impl<'a> FromPyObject<'a> for PySupportedCone {
-    fn extract_bound(obj: &Bound<'a, pyo3::PyAny>) -> PyResult<Self> {
+impl<'a, 'py> FromPyObject<'a, 'py> for PySupportedCone {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, pyo3::PyAny>) -> PyResult<Self> {
+        let obj: &Bound<'py, pyo3::PyAny> = &obj;
         let thetype = obj.get_type().name()?;
         let typestr = thetype.to_string_lossy();
 

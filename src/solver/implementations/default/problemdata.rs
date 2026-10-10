@@ -46,6 +46,84 @@ pub struct DefaultProblemData<T> {
 
     #[cfg(feature = "sdp")]
     pub(crate) chordal_info: Option<ChordalInfo<T>>,
+
+    // full symmetric copy of P for gather-only products (see P_mul)
+    P_full: FullSym<T>,
+}
+
+// Both triangles of a symmetric matrix stored by column, with the index of
+// the source triangular entry of every value so that it can be refreshed
+// when the triangular data changes.  y = Px is then a gather-only dot
+// product per row, with no scattered read-modify-write traffic.
+struct FullSym<T> {
+    colptr: Vec<usize>,
+    rowval: Vec<usize>,
+    nzval: Vec<T>,
+    src: Vec<usize>,
+}
+
+impl<T: FloatT> FullSym<T> {
+    fn new(P: &CscMatrix<T>) -> Self {
+        let n = P.n;
+        let mut cnt = vec![0usize; n + 1];
+        for j in 0..n {
+            for k in P.colptr[j]..P.colptr[j + 1] {
+                let i = P.rowval[k];
+                cnt[j + 1] += 1;
+                if i != j {
+                    cnt[i + 1] += 1;
+                }
+            }
+        }
+        for j in 0..n {
+            cnt[j + 1] += cnt[j];
+        }
+        let nnz = cnt[n];
+        let mut next = cnt.clone();
+        let mut rowval = vec![0usize; nnz];
+        let mut src = vec![0usize; nnz];
+        for j in 0..n {
+            for k in P.colptr[j]..P.colptr[j + 1] {
+                let i = P.rowval[k];
+                rowval[next[j]] = i;
+                src[next[j]] = k;
+                next[j] += 1;
+                if i != j {
+                    rowval[next[i]] = j;
+                    src[next[i]] = k;
+                    next[i] += 1;
+                }
+            }
+        }
+        assert!(rowval.iter().all(|&r| r < n));
+        let mut out = Self { colptr: cnt, rowval, nzval: vec![T::zero(); nnz], src };
+        out.refresh(P);
+        out
+    }
+
+    fn refresh(&mut self, P: &CscMatrix<T>) {
+        for (v, &k) in self.nzval.iter_mut().zip(&self.src) {
+            *v = P.nzval[k];
+        }
+    }
+
+    // y = P x
+    fn mul(&self, y: &mut [T], x: &[T]) {
+        let n = self.colptr.len() - 1;
+        assert!(y.len() == n && x.len() == n);
+        for (j, yj) in y.iter_mut().enumerate() {
+            let mut acc = T::zero();
+            for k in self.colptr[j]..self.colptr[j + 1] {
+                // SAFETY: k < nnz by colptr construction, and every row
+                // index was checked to be < n in new()
+                unsafe {
+                    let xk = *x.get_unchecked(*self.rowval.get_unchecked(k));
+                    acc = fmadd(*self.nzval.get_unchecked(k), xk, acc);
+                }
+            }
+            *yj = acc;
+        }
+    }
 }
 
 impl<T> DefaultProblemData<T>
@@ -147,7 +225,9 @@ where
         let normq = Some(q_new.norm_inf());
         let normb = Some(b_new.norm_inf());
 
+        let P_full = FullSym::new(&P_new);
         Self {
+            P_full,
             P: P_new,
             q: q_new,
             A: A_new,
@@ -163,6 +243,16 @@ where
             #[cfg(feature = "sdp")]
             chordal_info,
         }
+    }
+
+    /// y = P x, with P the (scaled) symmetric quadratic term
+    pub(crate) fn P_mul(&self, y: &mut [T], x: &[T]) {
+        self.P_full.mul(y, x);
+    }
+
+    /// to be called after the values of P are changed
+    pub(crate) fn refresh_P_full(&mut self) {
+        self.P_full.refresh(&self.P);
     }
 
     pub(crate) fn get_normq(&mut self) -> T {
@@ -251,36 +341,42 @@ where
         let scale_min = settings.equilibrate_min_scaling;
         let scale_max = settings.equilibrate_max_scaling;
 
+        // column norms of the scaled P, gathered while scaling
+        let mut pcol = vec![T::zero(); P.n];
+
         // perform scaling operations for a fixed number of steps
         for _ in 0..settings.equilibrate_max_iter {
             kkt_col_norms(P, A, dwork, ework);
 
-            //zero rows or columns should not get scaled
-            dwork.scalarop(|x| if x == T::zero() { T::one() } else { x });
-            ework.scalarop(|x| if x == T::zero() { T::one() } else { x });
+            // zero rows or columns should not get scaled, then take
+            // 1/sqrt of the norms and bound the cumulative scaling.
+            // (one fused, vectorizable pass per vector)
+            let fix = |w: &mut [T], cum: &[T]| {
+                for (w, &c) in izip!(w.iter_mut(), cum.iter()) {
+                    // clip(1/r, min/c, max/c) with r = sqrt(x), using a
+                    // single division: c/r < min <=> c < min r, etc.
+                    // (branch free, so that the loop vectorizes)
+                    let x = if *w == T::zero() { T::one() } else { *w };
+                    let r = T::sqrt(x);
+                    let (lo, hi) = (c < scale_min * r, c > scale_max * r);
+                    let num = if lo { scale_min } else if hi { scale_max } else { T::one() };
+                    let den = if lo || hi { c } else { r };
+                    *w = num / den;
+                }
+            };
+            fix(dwork, d);
+            fix(ework, e);
 
-            dwork.rsqrt();
-            ework.rsqrt();
-
-            // bound the cumulative scaling
-            for (dwork, &d) in izip!(dwork.iter_mut(), d.iter()) {
-                *dwork = T::clip(dwork, scale_min / d, scale_max / d);
-            }
-            for (ework, &e) in izip!(ework.iter_mut(), e.iter()) {
-                *ework = T::clip(ework, scale_min / e, scale_max / e);
-            }
-
-            // Scale the problem data and update the
-            // equilibration matrices
-            scale_data(P, A, q, b, Some(dwork), ework);
+            // Scale the problem data and update the equilibration
+            // matrices, collecting the column norms of the newly scaled P
+            // (to compute their mean) in the same pass over P
+            lrscale_col_norms(P, dwork, &mut pcol);
+            A.lrscale(ework, dwork);
+            q.hadamard(dwork);
+            b.hadamard(ework);
             d.hadamard(dwork);
             e.hadamard(ework);
-
-            // now use the Dwork array to hold the
-            // column norms of the newly scaled P
-            // so that we can compute the mean
-            P.col_norms(dwork);
-            let mean_col_norm_P = dwork.mean();
+            let mean_col_norm_P = pcol.mean();
             let inf_norm_q = q.norm_inf();
 
             if mean_col_norm_P != T::zero() && inf_norm_q != T::zero() {
@@ -309,6 +405,8 @@ where
         // update the inverse scaling data
         equil.dinv.scalarop_from(T::recip, d);
         equil.einv.scalarop_from(T::recip, e);
+
+        data.P_full.refresh(&data.P);
     }
 }
 
@@ -323,8 +421,37 @@ fn kkt_col_norms<T: FloatT>(
     norm_RHS: &mut [T],
 ) {
     P.col_norms_sym(norm_LHS); // P can be triu
-    A.col_norms_no_reset(norm_LHS); // incrementally from P norms
-    A.row_norms(norm_RHS); // same as column norms of A'
+    // column norms of A (incrementally from the P norms) and row norms of
+    // A (the column norms of A'), in one pass over A
+    norm_RHS.fill(T::zero());
+    assert!(norm_LHS.len() == A.n && norm_RHS.len() == A.m);
+    for (j, nl) in norm_LHS.iter_mut().enumerate() {
+        let mut m = *nl;
+        for k in A.colptr[j]..A.colptr[j + 1] {
+            let v = A.nzval[k].abs();
+            m = if v > m { v } else { m };
+            let nr = &mut norm_RHS[A.rowval[k]];
+            *nr = if v > *nr { v } else { *nr };
+        }
+        *nl = m;
+    }
+}
+
+// P = D P D for diagonal D, and the column norms of the result (of the
+// stored triangle, as P.col_norms) into `norms`
+fn lrscale_col_norms<T: FloatT>(P: &mut CscMatrix<T>, d: &[T], norms: &mut [T]) {
+    assert!(d.len() == P.n && norms.len() == P.n);
+    for (j, nj) in norms.iter_mut().enumerate() {
+        let (first, last) = (P.colptr[j], P.colptr[j + 1]);
+        let dj = d[j];
+        let mut m = T::zero();
+        for (v, &i) in P.nzval[first..last].iter_mut().zip(&P.rowval[first..last]) {
+            *v *= d[i] * dj;
+            let a = v.abs();
+            m = if a > m { a } else { m };
+        }
+        *nj = m;
+    }
 }
 
 fn scale_data<T: FloatT>(

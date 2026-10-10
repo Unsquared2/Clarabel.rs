@@ -25,6 +25,17 @@ pub struct DefaultKKTSystem<T> {
     x2: Vec<T>,
     z2: Vec<T>,
 
+    // P*x2, and P*ξ with ξ = x/τ for the current iterate (cached
+    // across the affine and combined solves of one iteration)
+    Px2: Vec<T>,
+    Pξ: Vec<T>,
+    Pξ_valid: bool,
+    // P*x for the current iterate, supplied by the solver when available
+    Px_hint: Option<Vec<T>>,
+    // q + 2Pξ, and the Δτ denominator, for the current iteration
+    qp: Vec<T>,
+    tau_den: T,
+
     // work vectors for assembling/dissambling vectors
     workx: Vec<T>,
     workz: Vec<T>,
@@ -46,7 +57,24 @@ where
         //here we allow scope for different KKT solvers, e.g.
         //direct vs indirect, different QR based direct methods
         //etc.   For now, we only have direct / LDL based
-        let kktsolver = if settings.direct_kkt_solver {
+        // The bound eliminating solver is used by the "auto" method for
+        // problems with only zero / nonnegative cones and at least one
+        // bound row.  An explicit "qdldl" selects the full quasidefinite
+        // KKT system factored by QDLDL.
+        let use_boundelim = settings.direct_kkt_solver
+            && settings.direct_solve_method == "auto"
+            && BoundElimKKTSolver::<T>::is_applicable(&data.A, cones);
+
+        let kktsolver: BoxedKKTSolver<T> = if use_boundelim {
+            Box::new(BoundElimKKTSolver::<T>::new(
+                &data.P,
+                &data.A,
+                cones,
+                m,
+                n,
+                settings.core(),
+            ))
+        } else if settings.direct_kkt_solver {
             Box::new(DirectLDLKKTSolver::<T>::new(
                 &data.P,
                 &data.A,
@@ -80,6 +108,12 @@ where
             z1,
             x2,
             z2,
+            Px2: vec![T::zero(); n],
+            Pξ: vec![T::zero(); n],
+            Pξ_valid: false,
+            Px_hint: None,
+            qp: vec![T::zero(); n],
+            tau_den: T::zero(),
             workx,
             workz,
             work_conic,
@@ -135,7 +169,6 @@ where
         settings: &DefaultSettings<T>,
     ) -> bool {
         let (x1, z1) = (&mut self.x1, &mut self.z1);
-        let (x2, z2) = (&self.x2, &self.z2); //from constant solve, so not mut
         let (workx, workz) = (&mut self.workx, &mut self.workz);
 
         // solve for (x1,z1)
@@ -165,47 +198,57 @@ where
             return false;
         }
 
-        // solve for Δτ.
-        // -----------
-        // Numerator first
-        let ξ = workx;
-        ξ.axpby(T::recip(variables.τ), &variables.x, T::zero());
-
-        let two: T = (2.).as_T();
-        let tau_num = rhs.τ - rhs.κ / variables.τ
-            + data.q.dot(x1)
-            + data.b.dot(z1)
-            + two * data.P.sym_up().quad_form(ξ, x1);
-
-        // offset ξ for the quadratic form in the denominator
-        let ξ_minus_x2 = ξ; //alias to ξ, same as workx
-        ξ_minus_x2.axpby(-T::one(), x2, T::one());
-
-        let mut tau_den = variables.κ / variables.τ - data.q.dot(x2) - data.b.dot(z2);
-        tau_den +=
-            data.P.sym_up().quad_form(ξ_minus_x2, ξ_minus_x2) - data.P.sym_up().quad_form(x2, x2);
-
-        // solve for (Δx,Δz)
-        // -----------
-        lhs.τ = tau_num / tau_den;
-        lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
-        lhs.z.waxpby(T::one(), z1, lhs.τ, z2);
-
-        // solve for Δs
-        // -------------
-        //  compute the linear term HₛΔz, where Hs = WᵀW for symmetric
-        //  cones and Hs = μH(z) for asymmetric cones
-        cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
-        lhs.s.axpby(-T::one(), Δs_const_term, -T::one()); // lhs.s = -(lhs.s+Δs_const_term);
-
-        // solve for Δκ
-        // --------------
-        lhs.κ = -(rhs.κ + variables.κ * lhs.τ) / variables.τ;
+        self.finish_solve(lhs, rhs, data, variables, cones);
 
         // we don't check the validity of anything
         // after the KKT solve, so just return is_success
         // without further validation
         is_success
+    }
+
+    fn set_Px_hint(&mut self, Px: Option<&[T]>) {
+        match Px {
+            Some(Px) => match &mut self.Px_hint {
+                Some(v) => {
+                    v.copy_from(Px);
+                }
+                None => self.Px_hint = Some(Px.to_vec()),
+            },
+            None => self.Px_hint = None,
+        }
+    }
+
+    fn update_and_solve_affine(
+        &mut self,
+        lhs: &mut DefaultVariables<T>,
+        rhs: &DefaultVariables<T>,
+        data: &DefaultProblemData<T>,
+        variables: &DefaultVariables<T>,
+        cones: &mut CompositeCone<T>,
+        settings: &DefaultSettings<T>,
+    ) -> (bool, bool) {
+        if !self.kktsolver.update(cones, settings.core()) {
+            return (false, false);
+        }
+
+        // constant part [-q; b] and the affine step part [rhs.x; s - rhs.z]
+        // are solved together with the new factors
+        self.workx.axpby(-T::one(), &data.q, T::zero());
+        self.work_conic.copy_from(&variables.s);
+        self.workz
+            .waxpby(T::one(), &self.work_conic, -T::one(), &rhs.z);
+
+        let is_success = self.kktsolver.solve_pair(
+            [(&self.workx, &data.b), (&rhs.x, &self.workz)],
+            [(&mut self.x2, &mut self.z2), (&mut self.x1, &mut self.z1)],
+            settings.core(),
+        );
+        if !is_success {
+            return (true, false);
+        }
+        self.after_constant_solve(data);
+        self.finish_solve(lhs, rhs, data, variables, cones);
+        (true, true)
     }
 
     fn solve_initial_point(
@@ -263,6 +306,70 @@ impl<T> DefaultKKTSystem<T>
 where
     T: FloatT,
 {
+    // given (x1,z1) from the variable part of the KKT solve, and the
+    // constant term Δs_const_term in self.work_conic, complete the step
+    fn finish_solve(
+        &mut self,
+        lhs: &mut DefaultVariables<T>,
+        rhs: &DefaultVariables<T>,
+        data: &DefaultProblemData<T>,
+        variables: &DefaultVariables<T>,
+        cones: &mut CompositeCone<T>,
+    ) {
+        let (x1, z1) = (&self.x1, &self.z1);
+        let (x2, z2) = (&self.x2, &self.z2);
+        let (workx, workz) = (&mut self.workx, &mut self.workz);
+        let Δs_const_term = &self.work_conic;
+
+        // solve for Δτ.
+        // -----------
+        // The quadratic forms below are all evaluated through the cached
+        // products P*x2 (computed once per KKT update) and P*ξ (computed
+        // once per iteration), so each solve needs only dot products:
+        //   2 ξ'P x1,  (ξ-x2)'P(ξ-x2) - x2'Px2 = ξ'Pξ - 2 ξ'Px2
+        // Everything except the x1/z1 terms is fixed for the iteration, so
+        // is computed with P*ξ on the first (affine) solve after an update:
+        // the denominator, and qp = q + 2Pξ for the numerator.
+        if !self.Pξ_valid {
+            let ξ = &mut *workx;
+            ξ.axpby(T::recip(variables.τ), &variables.x, T::zero());
+            match &self.Px_hint {
+                Some(Px) => {
+                    self.Pξ.axpby(T::recip(variables.τ), Px, T::zero());
+                }
+                None => data.P_mul(&mut self.Pξ, ξ),
+            }
+            let two: T = (2.).as_T();
+            let ξPξ = ξ.dot(&self.Pξ);
+            let ξPx2 = ξ.dot(&self.Px2);
+            self.tau_den = variables.κ / variables.τ - data.q.dot(x2) - data.b.dot(z2) + ξPξ
+                - two * ξPx2;
+            self.qp.waxpby(T::one(), &data.q, two, &self.Pξ);
+            self.Pξ_valid = true;
+        }
+
+        let tau_num = rhs.τ - rhs.κ / variables.τ + self.qp.dot(x1) + data.b.dot(z1);
+        let tau_den = self.tau_den;
+
+        // solve for (Δx,Δz)
+        // -----------
+        lhs.τ = tau_num / tau_den;
+        lhs.x.waxpby(T::one(), x1, lhs.τ, x2);
+        lhs.z.waxpby(T::one(), z1, lhs.τ, z2);
+
+        // solve for Δs
+        // -------------
+        //  compute the linear term HₛΔz, where Hs = WᵀW for symmetric
+        //  cones and Hs = μH(z) for asymmetric cones
+        cones.mul_Hs(&mut lhs.s, &lhs.z, workz);
+        lhs.s.axpby(-T::one(), Δs_const_term, -T::one()); // lhs.s = -(lhs.s+Δs_const_term);
+
+        // solve for Δκ
+        // --------------
+        lhs.κ = -(rhs.κ + variables.κ * lhs.τ) / variables.τ;
+
+    }
+
     fn solve_constant_rhs(
         &mut self,
         data: &DefaultProblemData<T>,
@@ -274,7 +381,13 @@ where
             self.kktsolver
                 .solve(Some(&mut self.x2), Some(&mut self.z2), settings.core());
 
+        self.after_constant_solve(data);
         is_success
+    }
+
+    fn after_constant_solve(&mut self, data: &DefaultProblemData<T>) {
+        data.P_mul(&mut self.Px2, &self.x2);
+        self.Pξ_valid = false;
     }
 
     pub(crate) fn update_P(&mut self, P: &CscMatrix<T>) {

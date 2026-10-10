@@ -134,6 +134,7 @@ pub(crate) trait SymMatrixMath<T> {
 
     /// Produces `y^T*M*x` for a symmetric `M`.
     ///
+    #[allow(dead_code)]
     fn quad_form(&self, y: &[T], x: &[T]) -> T;
 }
 

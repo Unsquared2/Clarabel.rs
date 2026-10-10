@@ -39,7 +39,7 @@ jobs:
             test: false
             
           # macOS Intel build
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64
             features: "python,pardiso"
             test: true
@@ -125,6 +125,8 @@ jobs:
     needs: 
       - build-wheels
       - sdist
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -138,10 +140,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+      # the "clarabel" project on PyPI belongs to the upstream repository
       - name: Publish to PyPi
+        if: github.repository_owner == 'oxfordcontrol'
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           pip install --upgrade twine
           twine upload --skip-existing --repository ${{ env.PYPI_TARGET  }} dist/*
+      # forks publish their wheels as assets of a GitHub release instead
+      - name: Publish to a GitHub release
+        if: github.repository_owner != 'oxfordcontrol'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --notes "Python wheels and sdist for $GITHUB_REF_NAME."
+          fi

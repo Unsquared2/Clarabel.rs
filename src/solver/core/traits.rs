@@ -102,6 +102,12 @@ pub trait Residuals<T: FloatT> {
     /// Compute residuals for the given variables.
     ///
     fn update(&mut self, variables: &Self::V, data: &Self::D);
+
+    /// P*x for the current iterate, if computed by the residuals
+    #[allow(non_snake_case)]
+    fn Px(&self) -> Option<&[T]> {
+        None
+    }
 }
 
 /// KKT linear solver object.
@@ -139,6 +145,39 @@ pub trait KKTSystem<T: FloatT> {
         data: &Self::D,
         settings: &Self::SE,
     ) -> bool;
+
+    /// Optionally provide P*x for the current iterate x, as already
+    /// computed by the residuals, so that the KKT system need not
+    /// recompute it.  The default implementation ignores it.
+    #[allow(non_snake_case)]
+    fn set_Px_hint(&mut self, _Px: Option<&[T]>) {}
+
+    /// Update the KKT system and solve for the affine step direction.
+    /// Implementations may share work between the constant-part solve of
+    /// the update and the affine solve, which both use the new factors.
+    #[allow(clippy::too_many_arguments)]
+    fn update_and_solve_affine(
+        &mut self,
+        step_lhs: &mut Self::V,
+        step_rhs: &Self::V,
+        data: &Self::D,
+        variables: &Self::V,
+        cones: &mut Self::C,
+        settings: &Self::SE,
+    ) -> (bool, bool) {
+        let ok = self.update(data, cones, settings);
+        let ok2 = ok
+            && self.solve(
+                step_lhs,
+                step_rhs,
+                data,
+                variables,
+                cones,
+                StepDirection::Affine,
+                settings,
+            );
+        (ok, ok2)
+    }
 }
 
 /// Printing functions for the solver's Info

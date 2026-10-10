@@ -138,18 +138,34 @@ where
         assert_eq!(dz.len(), z.len());
         assert_eq!(ds.len(), s.len());
 
-        let mut αz = αmax;
-        let mut αs = αmax;
-
-        for i in 0..z.len() {
-            if dz[i] < T::zero() {
-                αz = T::min(αz, -z[i] / dz[i]);
+        // For dv < 0 the ratio -v/dv is below the current α exactly when
+        // v + α dv < 0, so test that first and only divide when a new
+        // minimum is found (rarely, after the first few elements).
+        // Elements are screened 8 at a time with a branch-free test, and
+        // only flagged chunks are examined individually.
+        fn ratio_min<T: FloatT>(v: &[T], dv: &[T], mut α: T) -> T {
+            let scan = |v: &[T], dv: &[T], α: &mut T| {
+                for (&vi, &dvi) in zip(v, dv) {
+                    if vi + *α * dvi < T::zero() && dvi < T::zero() {
+                        *α = T::min(*α, -vi / dvi);
+                    }
+                }
+            };
+            let (vc, dvc) = (v.chunks_exact(8), dv.chunks_exact(8));
+            let (vr, dvr) = (vc.remainder(), dvc.remainder());
+            for (vk, dvk) in vc.zip(dvc) {
+                let mut hit = false;
+                for k in 0..8 {
+                    hit |= vk[k] + α * dvk[k] < T::zero();
+                }
+                if hit {
+                    scan(vk, dvk, &mut α);
+                }
             }
-            if ds[i] < T::zero() {
-                αs = T::min(αs, -s[i] / ds[i]);
-            }
+            scan(vr, dvr, &mut α);
+            α
         }
-        (αz, αs)
+        (ratio_min(z, dz, αmax), ratio_min(s, ds, αmax))
     }
 
     fn compute_barrier(&mut self, z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {

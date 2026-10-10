@@ -81,7 +81,10 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 
     fn dot(&self, y: &[T]) -> T {
-        zip(self, y).fold(T::zero(), |acc, (&x, &y)| acc + x * y)
+        let n = self.len().min(y.len());
+        let (x, y) = (&self[..n], &y[..n]);
+        // SAFETY: i < n for both slices
+        sum8(n, |i| unsafe { *x.get_unchecked(i) * *y.get_unchecked(i) })
     }
 
     fn dot_shifted(z: &[T], s: &[T], dz: &[T], ds: &[T], α: T) -> T {
@@ -89,13 +92,12 @@ impl<T: FloatT> VectorMath<T> for [T] {
         assert_eq!(z.len(), dz.len());
         assert_eq!(s.len(), ds.len());
 
-        let mut out = T::zero();
-        for (&s, &ds, &z, &dz) in izip!(s, ds, z, dz) {
-            let si = s + α * ds;
-            let zi = z + α * dz;
-            out += si * zi;
-        }
-        out
+        // SAFETY: all lengths are asserted equal above
+        sum8(z.len(), |i| unsafe {
+            let si = *s.get_unchecked(i) + α * *ds.get_unchecked(i);
+            let zi = *z.get_unchecked(i) + α * *dz.get_unchecked(i);
+            si * zi
+        })
     }
 
     fn dist(&self, y: &Self) -> T {
@@ -104,7 +106,8 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 
     fn sum(&self) -> T {
-        self.iter().fold(T::zero(), |acc, &x| acc + x)
+        // SAFETY: i < len
+        sum8(self.len(), |i| unsafe { *self.get_unchecked(i) })
     }
 
     fn sumsq(&self) -> T {
@@ -113,13 +116,38 @@ impl<T: FloatT> VectorMath<T> for [T] {
 
     // 2-norm
     fn norm(&self) -> T {
-        // T::sqrt(self.sumsq()) // not robust
+        // fast path: plain sum of squares when no over/underflow is possible
+        // SAFETY: i < len
+        let (amax, sumsq) = max_sumsq8(self.len(), |i| unsafe { *self.get_unchecked(i) });
+        let lo = T::min_positive_value().sqrt() / T::epsilon();
+        if amax > lo && sumsq.is_finite() {
+            return sumsq.sqrt();
+        }
+        if sumsq.is_nan() {
+            return T::nan();
+        }
+        if amax == T::zero() {
+            return T::zero();
+        }
         stable_norm(self.iter())
     }
 
     //2-norm of elementwise product self.*v
     fn norm_scaled(&self, v: &[T]) -> T {
         assert_eq!(self.len(), v.len());
+        // fast path: plain sum of squares when no over/underflow is possible
+        // SAFETY: lengths asserted equal
+        let (amax, sumsq) = max_sumsq8(self.len(), |i| unsafe { *self.get_unchecked(i) * *v.get_unchecked(i) });
+        let lo = T::min_positive_value().sqrt() / T::epsilon();
+        if amax > lo && sumsq.is_finite() {
+            return sumsq.sqrt();
+        }
+        if sumsq.is_nan() {
+            return T::nan();
+        }
+        if amax == T::zero() {
+            return T::zero();
+        }
         stable_norm(izip!(self, v).map(|(&yi, &vi)| yi * vi))
     }
 
@@ -130,30 +158,37 @@ impl<T: FloatT> VectorMath<T> for [T] {
 
     // Returns infinity norm
     fn norm_inf(&self) -> T {
-        let mut out = T::zero();
-        for &v in self {
-            if v.is_nan() {
-                return T::nan();
-            }
-            out = T::max(out, v.abs());
+        // SAFETY: i < len
+        let out = max8(self.len(), |i| unsafe { self.get_unchecked(i).abs() });
+        // (x - x) is NaN iff x is NaN or infinite, so this probe flags
+        // the need for an exact NaN check without a branchy main loop
+        let probe = sum8(self.len(), |i| unsafe {
+            *self.get_unchecked(i) - *self.get_unchecked(i)
+        });
+        if probe.is_nan() && self.iter().any(|v| v.is_nan()) {
+            return T::nan();
         }
         out
     }
 
     // Returns one norm
     fn norm_one(&self) -> T {
-        self.iter().fold(T::zero(), |acc, v| acc + v.abs())
+        // SAFETY: i < len
+        sum8(self.len(), |i| unsafe { self.get_unchecked(i).abs() })
     }
 
     //inf-norm of elementwise product self.*v
     fn norm_inf_scaled(&self, v: &Self) -> T {
         assert_eq!(self.len(), v.len());
-        zip(self, v).fold(T::zero(), |acc, (&x, &y)| T::max(acc, T::abs(x * y)))
+        // SAFETY: lengths asserted equal
+        max8(self.len(), |i| unsafe { T::abs(*self.get_unchecked(i) * *v.get_unchecked(i)) })
     }
 
     //
     fn norm_one_scaled(&self, v: &Self) -> T {
-        zip(self, v).fold(T::zero(), |acc, (&x, &y)| acc + T::abs(x * y))
+        let n = self.len().min(v.len());
+        // SAFETY: i < n for both slices
+        sum8(n, |i| unsafe { T::abs(*self.get_unchecked(i) * *v.get_unchecked(i)) })
     }
 
     // max absolute difference (used for unit testing)
@@ -162,18 +197,20 @@ impl<T: FloatT> VectorMath<T> for [T] {
     }
 
     fn minimum(&self) -> T {
-        self.iter().fold(T::infinity(), |r, &s| T::min(r, s))
+        // SAFETY: i < len
+        -max8_from(self.len(), -T::infinity(), |i| unsafe { -*self.get_unchecked(i) })
     }
 
     fn maximum(&self) -> T {
-        self.iter().fold(-T::infinity(), |r, &s| T::max(r, s))
+        // SAFETY: i < len
+        max8_from(self.len(), -T::infinity(), |i| unsafe { *self.get_unchecked(i) })
     }
 
     fn mean(&self) -> T {
         let mean = if self.is_empty() {
             T::zero()
         } else {
-            let num = self.iter().fold(T::zero(), |r, &s| r + s);
+            let num = self.sum();
             let den = T::from_usize(self.len()).unwrap();
             num / den
         };
@@ -223,4 +260,86 @@ where
                 }
             });
     scale * sumsq.sqrt()
+}
+
+// Reductions with 8 independent accumulators.  A single sequential
+// accumulator makes every reduction latency bound (one dependent add per
+// element); independent lanes let the compiler vectorize the loop.
+
+#[inline(always)]
+fn sum8<T: FloatT>(n: usize, f: impl Fn(usize) -> T) -> T {
+    let mut acc = [T::zero(); 8];
+    let n8 = n - n % 8;
+    let mut i = 0;
+    while i < n8 {
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a += f(i + k);
+        }
+        i += 8;
+    }
+    let mut out = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    for j in n8..n {
+        out += f(j);
+    }
+    out
+}
+
+// max over f(i) and the initial value.  NaN values are ignored, as with
+// T::max, so callers needing NaN propagation must check separately.
+#[inline(always)]
+fn max8_from<T: FloatT>(n: usize, init: T, f: impl Fn(usize) -> T) -> T {
+    let mut acc = [init; 8];
+    let n8 = n - n % 8;
+    let mut i = 0;
+    while i < n8 {
+        for (k, a) in acc.iter_mut().enumerate() {
+            let v = f(i + k);
+            *a = if v > *a { v } else { *a };
+        }
+        i += 8;
+    }
+    let mut out = init;
+    for a in acc {
+        out = if a > out { a } else { out };
+    }
+    for j in n8..n {
+        let v = f(j);
+        out = if v > out { v } else { out };
+    }
+    out
+}
+
+#[inline(always)]
+fn max8<T: FloatT>(n: usize, f: impl Fn(usize) -> T) -> T {
+    max8_from(n, T::zero(), f)
+}
+
+// max |f(i)| and sum f(i)² in a single pass, 8 lanes
+#[inline(always)]
+fn max_sumsq8<T: FloatT>(n: usize, f: impl Fn(usize) -> T) -> (T, T) {
+    let mut mx = [T::zero(); 8];
+    let mut sq = [T::zero(); 8];
+    let n8 = n - n % 8;
+    let mut i = 0;
+    while i < n8 {
+        for k in 0..8 {
+            let t = f(i + k);
+            let a = t.abs();
+            mx[k] = if a > mx[k] { a } else { mx[k] };
+            sq[k] += t * t;
+        }
+        i += 8;
+    }
+    let mut m = T::zero();
+    for a in mx {
+        m = if a > m { a } else { m };
+    }
+    let mut s = ((sq[0] + sq[4]) + (sq[1] + sq[5])) + ((sq[2] + sq[6]) + (sq[3] + sq[7]));
+    for j in n8..n {
+        let t = f(j);
+        let a = t.abs();
+        m = if a > m { a } else { m };
+        s += t * t;
+    }
+    (m, s)
 }

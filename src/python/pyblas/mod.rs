@@ -35,8 +35,12 @@ pub(crate) use get_ptr;
 
 fn get_capsule_void_ptr(pyx_capi: &Bound<PyAny>, name: &str) -> PyResult<*mut libc::c_void> {
     let binding = pyx_capi.get_item(name)?;
-    let capsule: &Bound<PyCapsule> = binding.downcast()?;
-    Ok(capsule.pointer())
+    let capsule: &Bound<PyCapsule> = binding.cast()?;
+    // the pointer stored under the capsule's own name, as PyCapsule_GetPointer
+    // expects.  SAFETY: the name is owned by the capsule, which outlives this
+    // call.
+    let name = capsule.name()?.map(|n| unsafe { n.as_cstr() });
+    Ok(capsule.pointer_checked(name)?.as_ptr())
 }
 
 fn get_pyx_capi<'a>(py: Python<'a>, pymodule: &str) -> PyResult<Bound<'a, PyAny>> {
