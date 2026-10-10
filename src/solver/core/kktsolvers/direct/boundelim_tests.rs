@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::needless_range_loop, clippy::field_reassign_with_default, clippy::type_complexity)]
 
-use super::banded::test_hooks::{NO_BANDED, NO_TWIST};
+use super::banded::test_hooks::{NO_BANDED, NO_SCHUR, NO_TWIST};
 use crate::algebra::*;
 use crate::solver::*;
 
@@ -48,10 +48,12 @@ fn settings(path: Path) -> DefaultSettings<f64> {
 
 fn solve_with(p: &Prob, path: Path, s: DefaultSettings<f64>) -> Out {
     NO_BANDED.with(|c| c.set(path == Path::AutoQdldlBackend));
+    NO_SCHUR.with(|c| c.set(path == Path::AutoQdldlBackend));
     NO_TWIST.with(|c| c.set(path == Path::AutoSingleChain));
     let mut solver = DefaultSolver::new(&p.P, &p.q, &p.A, &p.b, &p.cones, s).unwrap();
     solver.solve();
     NO_BANDED.with(|c| c.set(false));
+    NO_SCHUR.with(|c| c.set(false));
     NO_TWIST.with(|c| c.set(false));
     Out {
         status: solver.solution.status,
@@ -733,9 +735,11 @@ fn test_aux_variables_updates() {
         let fresh = solve(&p2, Path::Upstream);
         for path in [Path::Auto, Path::AutoQdldlBackend, Path::AutoSingleChain] {
             NO_BANDED.with(|c| c.set(path == Path::AutoQdldlBackend));
+            NO_SCHUR.with(|c| c.set(path == Path::AutoQdldlBackend));
             NO_TWIST.with(|c| c.set(path == Path::AutoSingleChain));
             let mut solver = DefaultSolver::new(&p.P, &p.q, &p.A, &p.b, &p.cones, settings(path)).unwrap();
             NO_BANDED.with(|c| c.set(false));
+            NO_SCHUR.with(|c| c.set(false));
             NO_TWIST.with(|c| c.set(false));
             solver.solve();
             solver.update_P(&P2).unwrap();
@@ -767,4 +771,135 @@ fn test_aux_variables_small() {
     // each kind of row, and the direct backend's two-lane residual
     check_all_paths(&rod_lsq(6, 1.0), 1e-6, "rod_lsq 6");
     check_all_paths(&random_lsq(1, 5, 4, false), 1e-6, "random_lsq small");
+}
+
+/// long-only factor-model portfolio as a modelling tool states it: risk
+/// ‖Fᵀw‖² through k auxiliary variables plus diagonal idiosyncratic risk,
+/// a budget and box bounds; with `sectors`, some sparse sector caps too,
+/// and with `dup_budget` the budget row twice (dependent equalities)
+fn portfolio(seed: u64, n: usize, k: usize, sectors: usize, dup_budget: bool) -> Prob {
+    let mut g = Lcg(seed);
+    let nv = n + k;
+    let mut tp: Vec<(usize, usize, f64)> = (0..n).map(|i| (i, i, 0.1 * g.f())).collect();
+    tp.extend((0..k).map(|i| (n + i, n + i, 1.0)));
+    let P = csc(nv, nv, tp);
+    let mut q: Vec<f64> = (0..n).map(|_| -0.05 * g.n()).collect();
+    q.resize(nv, 0.0);
+    let mut t = vec![];
+    let mut b = vec![];
+    // t = Fᵀw
+    for i in 0..k {
+        t.push((i, n + i, 1.0));
+        for j in 0..n {
+            t.push((i, j, -g.n() / (k as f64).sqrt()));
+        }
+        b.push(0.0);
+    }
+    let nbud = if dup_budget { 2 } else { 1 };
+    for r in 0..nbud {
+        for j in 0..n {
+            t.push((k + r, j, 1.0));
+        }
+        b.push(1.0);
+    }
+    let neq = k + nbud;
+    let mut m = neq;
+    for s in 0..sectors {
+        for j in (s..n).step_by(sectors.max(1) * 3) {
+            t.push((m, j, 1.0));
+        }
+        b.push(0.4);
+        m += 1;
+    }
+    for j in 0..n {
+        t.push((m, j, -1.0));
+        b.push(0.0);
+        t.push((m + 1, j, 1.0));
+        b.push(0.05_f64.max(2.0 / n as f64));
+        m += 2;
+    }
+    let A = csc(m, nv, t);
+    Prob { P, q, A, b, cones: vec![ZeroConeT(neq), NonnegativeConeT(m - neq)] }
+}
+
+#[test]
+fn test_schur_backend() {
+    // dense factor rows (dense mode), with sparse sector rows, and with a
+    // repeated budget row, whose S is singular (exact factorization fails,
+    // the regularized one is used)
+    for (p, what) in [
+        (portfolio(1, 60, 5, 0, false), "portfolio"),
+        (portfolio(2, 80, 8, 3, false), "portfolio + sectors"),
+        (portfolio(3, 40, 4, 0, true), "portfolio, repeated budget"),
+        (portfolio(4, 200, 3, 12, false), "portfolio, many sectors"),
+    ] {
+        let outs = check_all_paths(&p, 1e-6, what);
+        assert!(outs[1].solver_name.starts_with("schur"), "{what}: {}", outs[1].solver_name);
+        assert!(outs[2].solver_name.starts_with("qdldl+boundelim"), "{what}: {}", outs[2].solver_name);
+        assert_kkt(&p, &outs[1], 1e-6, what);
+    }
+    // LPs with every variable bounded also qualify (P = 0), unless the
+    // banded backend takes them
+    let mut nschur = 0;
+    for seed in 0..10 {
+        let p = random_qp(100 + seed, 30 + 3 * seed as usize, true);
+        let outs = check_all_paths(&p, 1e-6, &format!("lp {seed}"));
+        nschur += outs[1].solver_name.starts_with("schur") as usize;
+    }
+    assert!(nschur >= 5, "{nschur} of 10 LPs on the Schur backend");
+}
+
+#[test]
+fn test_schur_refinement_fallback() {
+    // with refinement tolerances of zero no solve counts as refined, so
+    // every exact Schur solve falls back to the regularized factors (and
+    // solves again); the answers must not change
+    let p = portfolio(6, 60, 5, 2, false);
+    let tight = |path: Path| {
+        let mut s = settings(path);
+        s.iterative_refinement_reltol = 0.0;
+        s.iterative_refinement_abstol = 0.0;
+        s
+    };
+    let up = solve_with(&p, Path::Upstream, tight(Path::Upstream));
+    let new = solve_with(&p, Path::Auto, tight(Path::Auto));
+    assert!(new.solver_name.starts_with("schur"), "{}", new.solver_name);
+    assert_close(&new, &up, 1e-6, "schur fallback");
+    assert_kkt(&p, &new, 1e-6, "schur fallback");
+}
+
+#[test]
+fn test_schur_updates() {
+    // new risk weights, factor loadings and returns, on the Schur backend
+    // and on QDLDL, against a fresh solve
+    let p = portfolio(5, 50, 4, 2, false);
+    let mut g = Lcg(23);
+    let P2: Vec<f64> = p.P.nzval.iter().map(|v| v * (1.0 + 0.5 * g.f())).collect();
+    let A2: Vec<f64> = p.A.nzval.iter().map(|v| v * (1.0 + 0.1 * g.f())).collect();
+    let q2: Vec<f64> = p.q.iter().map(|v| v + 0.02 * g.n()).collect();
+    let mut p2 = Prob { P: p.P.clone(), q: q2.clone(), A: p.A.clone(), b: p.b.clone(), cones: p.cones.clone() };
+    p2.P.nzval = P2.clone();
+    p2.A.nzval = A2.clone();
+    let fresh = solve(&p2, Path::Upstream);
+    for path in [Path::Auto, Path::AutoQdldlBackend] {
+        NO_SCHUR.with(|c| c.set(path == Path::AutoQdldlBackend));
+        let mut solver = DefaultSolver::new(&p.P, &p.q, &p.A, &p.b, &p.cones, settings(path)).unwrap();
+        NO_SCHUR.with(|c| c.set(false));
+        let name = solver.info.linsolver.name.clone();
+        assert_eq!(name.starts_with("schur"), path == Path::Auto, "{name}");
+        solver.solve();
+        solver.update_P(&P2).unwrap();
+        solver.update_A(&A2).unwrap();
+        solver.update_q(&q2).unwrap();
+        solver.solve();
+        let updated = Out {
+            status: solver.solution.status,
+            s: solver.solution.s.clone(),
+            x: solver.solution.x.clone(),
+            z: solver.solution.z.clone(),
+            obj: solver.solution.obj_val,
+            solver_name: String::new(),
+        };
+        assert_close(&updated, &fresh, 1e-6, &format!("schur updates {path:?}"));
+    }
 }

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 Version numbering in this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).  We aim to keep the core solver functionality and minor releases in sync between the Rust/Python and Julia implementations.  Small fixes that affect one implementation only may result in the patch release versions differing.
 
+## [0.11.1+unsquared.2] - 2026-10-10
+
+### Changed
+
+- A dense Schur complement backend for reduced KKT systems whose P is diagonal, with every variable having a positive diagonal (P_jj > 0 or a bound), and few constraint rows, such as factor-model portfolios after the elimination of their auxiliary variables.  The variables are eliminated analytically and S = G + A D⁻¹ Aᵀ is factored by a dense Cholesky.  It first factors the unregularized system, since that system is safe to factor exactly, so that solves are exact and rarely need a refinement step; the regularized system is used when a pivot is small.  Its dense kernels use AVX2 + FMA when the CPU has them (detected at run time).
+
 ## [0.11.1+unsquared.1] - 2026-10-09
 
 Release of the Unsquared2 fork; Python wheels are attached to the GitHub release rather than published to PyPI.

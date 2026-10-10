@@ -55,6 +55,7 @@ pub(crate) mod test_hooks {
     thread_local! {
         pub(crate) static NO_TWIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(crate) static NO_BANDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(crate) static NO_SCHUR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     #[inline]
     pub(crate) fn no_twist() -> bool {
@@ -67,6 +68,13 @@ pub(crate) mod test_hooks {
     pub(crate) fn no_banded() -> bool {
         #[cfg(test)]
         return NO_BANDED.with(|c| c.get());
+        #[cfg(not(test))]
+        false
+    }
+    #[inline]
+    pub(crate) fn no_schur() -> bool {
+        #[cfg(test)]
+        return NO_SCHUR.with(|c| c.get());
         #[cfg(not(test))]
         false
     }
